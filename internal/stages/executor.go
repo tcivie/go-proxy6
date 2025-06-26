@@ -24,17 +24,11 @@ func (s *RequestExecutorStage) Name() string {
 }
 
 func (s *RequestExecutorStage) Process(req *pipeline.Request) error {
+	slog.Debug("RequestExecutorStage processing",
+		slog.String("stage", s.Name()),
+		slog.String("request_id", req.ID))
+
 	httpReq := req.Data.HTTPReq
-	slog.Debug(req.ID,
-		slog.String("method", httpReq.Method),
-		slog.String("host", httpReq.Host),
-		slog.String("path", httpReq.URL.Path),
-		slog.String("target", req.Data.Target),
-		slog.String("bind", req.Data.BindAddr.IP.String()),
-		slog.String("client", httpReq.RemoteAddr),
-		slog.String("user-agent", httpReq.UserAgent()),
-		slog.String("referer", httpReq.Referer()),
-		slog.String("x-forwarded-for", httpReq.Header.Get("X-Forwarded-For")))
 
 	if httpReq.Method == http.MethodConnect {
 		return s.handleConnect(req)

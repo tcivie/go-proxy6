@@ -22,15 +22,14 @@ func (s *IPv6GeneratorStage) Name() string {
 }
 
 func (s *IPv6GeneratorStage) Process(req *pipeline.Request) error {
+	slog.Debug("IPv6GeneratorStage processing",
+		slog.String("stage", s.Name()),
+		slog.String("request_id", req.ID))
+
 	addr, err := s.generator.RandomAddr()
 	if err != nil {
 		return fmt.Errorf("IPv6 generation failed: %v", err)
 	}
-	slog.Debug(
-		req.ID,
-		slog.String("ip", addr.IP.String()),
-		slog.String("port", fmt.Sprintf("%d", addr.Port)),
-		slog.String("network", addr.Network()))
 
 	req.Data.BindAddr = addr
 	log.Printf("[%s] Generated IPv6: %s", req.ID, addr.IP)
