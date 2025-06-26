@@ -23,44 +23,14 @@ func NewGenerator(network *net.IPNet, base net.IP) *Generator {
 }
 
 func (g *Generator) RandomAddr() (*net.TCPAddr, error) {
-	startTime := time.Now()
-
-	for attempt := 1; attempt <= g.maxRetries; attempt++ {
-		ip, err := g.randomIP()
-		if err != nil {
-			slog.Error("Failed to generate random IP",
-				"attempt", attempt,
-				"error", err.Error())
-			continue
-		}
-
-		slog.Debug("Generated IPv6 address",
-			"attempt", attempt,
-			"ip", ip.String())
-
-		if g.isValidIPv6(ip) {
-			elapsed := time.Since(startTime)
-			slog.Info("Successfully generated valid IPv6 address",
-				"ip", ip.String(),
-				"attempts", attempt,
-				"elapsed_ms", elapsed.Milliseconds())
-			return &net.TCPAddr{IP: ip, Port: 0}, nil
-		}
-
-		slog.Debug("IPv6 address validation failed",
-			"ip", ip.String(),
-			"attempt", attempt)
-
-		if attempt < g.maxRetries {
-			time.Sleep(time.Millisecond * 100)
-		}
+	ip, err := g.randomIP()
+	if err != nil {
+		slog.Error("Failed to generate random IP", "error", err.Error())
+		return nil, err
 	}
 
-	slog.Error("Failed to generate valid IPv6 address after all retries",
-		"max_retries", g.maxRetries,
-		"total_elapsed_ms", time.Since(startTime).Milliseconds())
-
-	return nil, fmt.Errorf("failed to generate valid IPv6 address after %d attempts", g.maxRetries)
+	slog.Info("Generated IPv6 address", "ip", ip.String())
+	return &net.TCPAddr{IP: ip, Port: 0}, nil
 }
 
 func (g *Generator) randomIP() (net.IP, error) {
