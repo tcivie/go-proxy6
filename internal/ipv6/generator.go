@@ -28,7 +28,6 @@ func (g *Generator) RandomAddr() (*net.TCPAddr, error) {
 		return nil, err
 	}
 
-	slog.Info("Generated IPv6 address", "ip", ip.String())
 	return &net.TCPAddr{IP: ip, Port: 0}, nil
 }
 
