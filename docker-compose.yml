@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  ipv6-proxy:
+    build: .
+    container_name: ipv6-proxy
+    privileged: true
+    network_mode: host
+    environment:
+      - SUBNET=2a01:4f9:c012:83eb::/64  # Change this to your IPv6 subnet
+      - BIND=0.0.0.0:8080
+      - WORKERS=50
+    restart: unless-stopped
+    volumes:
+      - /proc:/host/proc:ro
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
