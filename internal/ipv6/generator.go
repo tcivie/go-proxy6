@@ -103,11 +103,13 @@ func (g *Generator) isValidIPv6(ip net.IP) bool {
 	addr := &net.TCPAddr{IP: ip, Port: 0}
 	listener, err := net.ListenTCP("tcp6", addr)
 	if err != nil {
-		slog.Debug("TCP bind test failed",
+		slog.Warn("TCP bind test failed",
 			"ip", ip.String(),
-			"error", err.Error())
+			"error", err.Error(),
+			"error_type", fmt.Sprintf("%T", err))
 		return false
 	}
 	listener.Close()
+	slog.Debug("TCP bind test succeeded", "ip", ip.String())
 	return true
 }
