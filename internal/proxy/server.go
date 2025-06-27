@@ -65,13 +65,19 @@ func (s *Server) Start() error {
 	go s.processRequests()
 
 	// Setup HTTP handlers
-	http.Handle("/", http.HandlerFunc(s.handleRequest))
+	server := &http.Server{
+		Addr: s.config.BindAddr,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			log.Printf("Incoming request: %s %s -> %s", r.Method, r.Host, r.RequestURI)
+			s.handleRequest(w, r)
+		}),
+	}
 
 	log.Printf("Starting high-performance IPv6 proxy on %s", s.config.BindAddr)
 	log.Printf("IPv6 subnet: %s", s.config.IPv6Subnet)
 	log.Printf("Max workers: %d", s.maxWorkers)
 
-	return http.ListenAndServe(s.config.BindAddr, nil)
+	return server.ListenAndServe()
 }
 
 func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
