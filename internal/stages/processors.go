@@ -39,6 +39,7 @@ func (p *IPv6Processor) Process(ctx context.Context, payload pipeline.Payload) (
 	}
 
 	httpPayload.BindAddr = addr
+	log.Printf("[%s] ⇄ IPv6 %s", httpPayload.ID, addr.IP.String())
 	return httpPayload, nil
 }
 
@@ -86,6 +87,7 @@ func (p *TargetProcessor) Process(ctx context.Context, payload pipeline.Payload)
 	}
 
 	httpPayload.Target = target
+	log.Printf("[%s] ⇉ Target %s", httpPayload.ID, target)
 	return httpPayload, nil
 }
 
@@ -117,7 +119,7 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	bindAddr := payload.BindAddr
 	resp := payload.Response
 
-	log.Printf("CONNECT (tunnel) to: %s via IPv6: %s", target, bindAddr.IP.String())
+	log.Printf("[%s] ⇆ CONNECT %s via %s", payload.ID, target, bindAddr.IP.String())
 
 	dialer := &net.Dialer{
 		LocalAddr: bindAddr,
@@ -208,6 +210,7 @@ func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 		RawQuery: req.URL.RawQuery,
 		Fragment: req.URL.Fragment,
 	}
+	log.Printf("[%s] ⇆ HTTP %s %s via %s", payload.ID, req.Method, targetURL.String(), bindAddr.IP.String())
 
 	// Create proxy request
 	proxyReq, err := http.NewRequestWithContext(payload.Ctx, req.Method, targetURL.String(), req.Body)
@@ -253,6 +256,7 @@ func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 	payload.MarkResponseSent()
 
 	_, err = io.Copy(resp, proxyResp.Body)
+	log.Printf("[%s] ⇇ HTTP %d", payload.ID, proxyResp.StatusCode)
 	return err
 }
 

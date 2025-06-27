@@ -68,7 +68,6 @@ func (s *Server) Start() error {
 	server := &http.Server{
 		Addr: s.config.BindAddr,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			log.Printf("Incoming request: %s %s -> %s", r.Method, r.Host, r.RequestURI)
 			s.handleRequest(w, r)
 		}),
 	}
@@ -86,12 +85,14 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	// Create payload with request-specific context
+	id := generateID()
 	payload := pipeline.NewHTTPPayload(
-		generateID(),
+		id,
 		requestCtx,
 		r,
 		w,
 	)
+	log.Printf("[%s] → %s %s", id, r.Method, r.Host)
 
 	// Send to processing channel (non-blocking)
 	select {
