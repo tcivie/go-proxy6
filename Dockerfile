@@ -20,7 +20,6 @@ COPY --from=builder /app/ipv6-proxy .
 # Default subnet (override with -e SUBNET=your_subnet)
 ENV SUBNET="2a01:4f9:c012:83eb::/64"
 ENV BIND="0.0.0.0:8080"
-ENV WORKERS="50"
 
 # Setup script that configures IPv6 and starts proxy
 COPY <<EOF /app/start.sh
@@ -39,7 +38,7 @@ sysctl net.ipv6.ip_nonlocal_bind=1
 # Add local route for the subnet
 ip route add local \$SUBNET dev \$INTERFACE 2>/dev/null || echo "Route already exists"
 
-exec ./ipv6-proxy -bind="\$BIND" -subnet="\$SUBNET" -workers=\$WORKERS
+exec ./ipv6-proxy -bind="\$BIND" -subnet="\$SUBNET"
 EOF
 
 RUN chmod +x /app/start.sh
