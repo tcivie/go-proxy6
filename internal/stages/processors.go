@@ -115,100 +115,81 @@ func (p *ProxyProcessor) Process(ctx context.Context, payload pipeline.Payload) 
 // Simple CONNECT handler that creates an IPv6 tunnel
 func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	target := payload.Target
-	bindAddr := payload.BindAddr
 	resp := payload.Response
+	req := payload.Request
+	bindAddr := payload.BindAddr
 
-	log.Printf("CONNECT request to: %s via IPv6: %s", target, bindAddr.IP.String())
+	log.Printf("MITM: CONNECT %s via %s", target, bindAddr.IP)
 
-	// Connect to target using our IPv6 address
-	dialer := &net.Dialer{
-		LocalAddr: bindAddr,
-		Timeout:   10 * time.Second,
-	}
-
-	// Direct connection to target through IPv6
-	targetConn, err := dialer.Dial("tcp6", target)
-	if err != nil {
-		if !payload.ResponseSent() {
-			http.Error(resp, "Failed to connect to target", http.StatusBadGateway)
-			payload.MarkResponseSent()
-		}
-		return fmt.Errorf("failed to connect to %s: %v", target, err)
-	}
-	defer targetConn.Close()
-
-	// Log successful connection
-	log.Printf("Successfully connected to %s", target)
-
-	// Hijack client connection
+	// Hijack the client connection
 	hijacker, ok := resp.(http.Hijacker)
 	if !ok {
-		if !payload.ResponseSent() {
-			http.Error(resp, "Hijacking not supported", http.StatusInternalServerError)
-			payload.MarkResponseSent()
-		}
+		http.Error(resp, "Hijacking not supported", http.StatusInternalServerError)
+		payload.MarkResponseSent()
 		return fmt.Errorf("hijacking not supported")
 	}
 
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		if !payload.ResponseSent() {
-			http.Error(resp, "Failed to hijack connection", http.StatusInternalServerError)
-			payload.MarkResponseSent()
-		}
-		return fmt.Errorf("failed to hijack connection: %v", err)
+		http.Error(resp, "Failed to hijack connection", http.StatusInternalServerError)
+		payload.MarkResponseSent()
+		return fmt.Errorf("hijack failed: %v", err)
 	}
 	defer clientConn.Close()
 
-	// Send 200 Connection Established
+	// Acknowledge CONNECT with 200
 	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
 	if err != nil {
-		return fmt.Errorf("failed to send 200 response: %v", err)
+		return fmt.Errorf("failed to send 200: %v", err)
 	}
 	payload.MarkResponseSent()
 
-	// Set reasonable timeouts
-	clientConn.SetDeadline(time.Now().Add(5 * time.Minute))
-	targetConn.SetDeadline(time.Now().Add(5 * time.Minute))
-
-	// Create a TLS connection to the target
-	cert, err := util.GenerateSelfSignedCert()
+	// Create TLS server for the client side
+	cert, err := util.GenerateSelfSignedCert() // or generate per-host certificate
 	if err != nil {
-		return fmt.Errorf("failed to generate certificate: %v", err)
+		return fmt.Errorf("cert generation failed: %v", err)
 	}
-
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		// Add any other necessary TLS configurations
+		ServerName:   req.Host,
+	}
+	tlsClientConn := tls.Server(clientConn, tlsConfig)
+	if err := tlsClientConn.Handshake(); err != nil {
+		return fmt.Errorf("TLS handshake with client failed: %v", err)
 	}
 
-	tlsConn := tls.Client(targetConn, tlsConfig)
-	if err := tlsConn.Handshake(); err != nil {
-		return fmt.Errorf("TLS handshake failed: %v", err)
+	// Dial target via IPv6
+	dialer := &net.Dialer{
+		LocalAddr: bindAddr,
+		Timeout:   10 * time.Second,
+	}
+	rawTargetConn, err := dialer.Dial("tcp6", target)
+	if err != nil {
+		return fmt.Errorf("dial to %s failed: %v", target, err)
+	}
+	defer rawTargetConn.Close()
+
+	// TLS connection to the remote target
+	tlsTargetConn := tls.Client(rawTargetConn, &tls.Config{
+		ServerName: strings.Split(req.Host, ":")[0],
+	})
+	if err := tlsTargetConn.Handshake(); err != nil {
+		return fmt.Errorf("TLS handshake with target failed: %v", err)
 	}
 
-	// Create bidirectional tunnel
+	// Proxy both directions
 	errCh := make(chan error, 2)
-
-	// Copy from client to target
 	go func() {
-		_, err := io.Copy(tlsConn, clientConn)
+		_, err := io.Copy(tlsTargetConn, tlsClientConn)
 		errCh <- err
 	}()
-
-	// Copy from target to client
 	go func() {
-		_, err := io.Copy(clientConn, tlsConn)
+		_, err := io.Copy(tlsClientConn, tlsTargetConn)
 		errCh <- err
 	}()
-
-	// Wait for either copy to finish
 	err = <-errCh
-	if err != nil && err != io.EOF {
-		return fmt.Errorf("tunnel error: %v", err)
-	}
 
-	return nil
+	return err
 }
 
 // Handle HTTP requests
