@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -31,13 +30,12 @@ func (p *IPv6Processor) Process(ctx context.Context, payload pipeline.Payload) (
 
 	addr, err := p.generator.RandomAddr()
 	if err != nil {
-		// Send error response and complete the request
 		if !httpPayload.ResponseSent() {
 			http.Error(httpPayload.Response, "IPv6 address generation failed", http.StatusInternalServerError)
 			httpPayload.MarkResponseSent()
 		}
 		httpPayload.Complete(fmt.Errorf("IPv6 generation failed: %v", err))
-		return nil, nil // Don't propagate error, request is handled
+		return nil, nil
 	}
 
 	httpPayload.BindAddr = addr
@@ -68,13 +66,12 @@ func (p *TargetProcessor) Process(ctx context.Context, payload pipeline.Payload)
 			host = req.URL.Host
 		}
 		if host == "" {
-			// Send error response and complete the request
 			if !httpPayload.ResponseSent() {
 				http.Error(httpPayload.Response, "Missing host", http.StatusBadRequest)
 				httpPayload.MarkResponseSent()
 			}
 			httpPayload.Complete(fmt.Errorf("missing host"))
-			return nil, nil // Don't propagate error, request is handled
+			return nil, nil
 		}
 
 		// Determine port based on scheme or default
@@ -111,18 +108,27 @@ func (p *ProxyProcessor) Process(ctx context.Context, payload pipeline.Payload) 
 
 	// Always complete the request, regardless of error
 	httpPayload.Complete(err)
-	return nil, nil // Never propagate errors that would kill the pipeline
+	return nil, nil
 }
 
+// Simple CONNECT handler that creates an IPv6 tunnel
 func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	target := payload.Target
 	bindAddr := payload.BindAddr
 	resp := payload.Response
 
-	// Log the CONNECT request
-	log.Printf("CONNECT request to: %s via IPv6: %s", target, bindAddr.IP.String())
+	// Connect to target
+	targetConn, err := p.dialWithIPv6(target, bindAddr.IP)
+	if err != nil {
+		if !payload.ResponseSent() {
+			http.Error(resp, "Failed to connect to target", http.StatusBadGateway)
+			payload.MarkResponseSent()
+		}
+		return fmt.Errorf("failed to connect to %s: %v", target, err)
+	}
+	defer targetConn.Close()
 
-	// First, hijack the client connection
+	// Hijack client connection
 	hijacker, ok := resp.(http.Hijacker)
 	if !ok {
 		if !payload.ResponseSent() {
@@ -132,7 +138,7 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 		return fmt.Errorf("hijacking not supported")
 	}
 
-	clientConn, clientBuf, err := hijacker.Hijack()
+	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
 		if !payload.ResponseSent() {
 			http.Error(resp, "Failed to hijack connection", http.StatusInternalServerError)
@@ -142,145 +148,42 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	}
 	defer clientConn.Close()
 
-	// Create context with timeout for connection
-	connCtx, connCancel := context.WithTimeout(payload.Ctx, 30*time.Second)
-	defer connCancel()
-
-	// Connect to the target with IPv6 binding
-	dialer := &net.Dialer{
-		LocalAddr: bindAddr,
-		Timeout:   20 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-
-	// Parse the target address for logging
-	host, port, _ := net.SplitHostPort(target)
-	log.Printf("Establishing CONNECT tunnel to %s:%s", host, port)
-
-	// Connect to the target
-	destConn, err := dialer.DialContext(connCtx, "tcp6", target)
+	// Send 200 Connection Established
+	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
 	if err != nil {
-		// Send error response if we haven't already
-		if !payload.ResponseSent() {
-			clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"))
-			payload.MarkResponseSent()
-		}
-		return fmt.Errorf("failed to connect to target %s: %v", target, err)
-	}
-	defer destConn.Close()
-
-	// Set reasonable buffer sizes
-	if tcpConn, ok := destConn.(*net.TCPConn); ok {
-		tcpConn.SetReadBuffer(65536)
-		tcpConn.SetWriteBuffer(65536)
-		tcpConn.SetNoDelay(true)
-	}
-
-	// Mark the response as sent to prevent Go from sending another response
-	payload.MarkResponseSent()
-
-	// Send the 200 Connection Established response
-	// This is the MOST CRITICAL part - it must be exactly in this format
-	success := "HTTP/1.1 200 Connection established\r\n\r\n"
-	if _, err := clientConn.Write([]byte(success)); err != nil {
 		return fmt.Errorf("failed to send 200 response: %v", err)
 	}
+	payload.MarkResponseSent()
 
-	log.Printf("CONNECT tunnel established to %s", target)
+	// Set reasonable timeouts
+	clientConn.SetDeadline(time.Now().Add(5 * time.Minute))
+	targetConn.SetDeadline(time.Now().Add(5 * time.Minute))
 
-	// Flush any buffered data from hijacked connection to the target
-	if clientBuf.Reader.Buffered() > 0 {
-		buf := make([]byte, clientBuf.Reader.Buffered())
-		clientBuf.Reader.Read(buf)
-		destConn.Write(buf)
-	}
-
-	// Use a WaitGroup to manage our goroutines
-	var wg sync.WaitGroup
-	wg.Add(2)
+	// Create bidirectional tunnel
+	errCh := make(chan error, 2)
 
 	// Copy from client to target
 	go func() {
-		defer wg.Done()
-		buf := make([]byte, 65536)
-		for {
-			// Set a read deadline
-			clientConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
-
-			n, err := clientConn.Read(buf)
-			if n > 0 {
-				// Set a write deadline
-				destConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-				if _, err := destConn.Write(buf[:n]); err != nil {
-					log.Printf("Error writing to target: %v", err)
-					break
-				}
-			}
-			if err != nil {
-				if err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
-					log.Printf("Error reading from client: %v", err)
-				}
-				break
-			}
-		}
-
-		// Signal the server we're done writing
-		if tcpConn, ok := destConn.(*net.TCPConn); ok {
-			tcpConn.CloseWrite()
-		} else {
-			destConn.Close()
-		}
+		_, err := io.Copy(targetConn, clientConn)
+		errCh <- err
 	}()
 
 	// Copy from target to client
 	go func() {
-		defer wg.Done()
-		buf := make([]byte, 65536)
-		for {
-			// Set a read deadline
-			destConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
-
-			n, err := destConn.Read(buf)
-			if n > 0 {
-				// Set a write deadline
-				clientConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-				if _, err := clientConn.Write(buf[:n]); err != nil {
-					log.Printf("Error writing to client: %v", err)
-					break
-				}
-			}
-			if err != nil {
-				if err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
-					log.Printf("Error reading from target: %v", err)
-				}
-				break
-			}
-		}
-
-		// Signal the client we're done writing
-		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
-			tcpConn.CloseWrite()
-		} else {
-			clientConn.Close()
-		}
+		_, err := io.Copy(clientConn, targetConn)
+		errCh <- err
 	}()
 
-	// Wait for copying to complete or context to be canceled
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		log.Printf("CONNECT tunnel closed normally for %s", target)
-		return nil
-	case <-payload.Ctx.Done():
-		log.Printf("CONNECT tunnel closed due to context cancellation for %s", target)
-		return payload.Ctx.Err()
+	// Wait for either copy to finish
+	err = <-errCh
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("tunnel error: %v", err)
 	}
+
+	return nil
 }
+
+// Handle HTTP requests
 func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 	req := payload.Request
 	resp := payload.Response
@@ -290,53 +193,23 @@ func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 	isHTTPS := req.TLS != nil || req.Header.Get("X-Forwarded-Proto") == "https" ||
 		strings.HasSuffix(payload.Target, ":443")
 
-	// Create transport with IPv6-only custom dialer
+	// Create a simple transport with IPv6 dialer
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			// Force IPv6-only to prevent IP leakage
-			return p.dialWithBind(addr, bindAddr)
+			return p.dialWithIPv6(addr, bindAddr.IP)
 		},
+		// Basic TLS config
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: false,
-			MinVersion:         tls.VersionTLS12,
-			MaxVersion:         tls.VersionTLS13,
-			// Add full suite of cipher suites for maximum compatibility
-			CipherSuites: []uint16{
-				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-				// Add additional cipher suites for compatibility
-				tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
-			},
-			// Add client-initiated renegotiation for problematic servers
-			Renegotiation: tls.RenegotiateOnceAsClient,
 		},
-		// Increase all timeouts for better reliability
-		DisableKeepAlives:     false,
-		DisableCompression:    false,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   10,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   20 * time.Second, // Increased from 10s
-		ResponseHeaderTimeout: 30 * time.Second, // Add timeout for headers
-		ExpectContinueTimeout: 1 * time.Second,
-		ForceAttemptHTTP2:     true,
+		// Standard timeouts
+		TLSHandshakeTimeout: 10 * time.Second,
+		IdleConnTimeout:     30 * time.Second,
 	}
 
 	client := &http.Client{
 		Transport: transport,
 		Timeout:   30 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// Allow up to 10 redirects
-			if len(via) >= 10 {
-				return http.ErrUseLastResponse
-			}
-			return nil
-		},
 	}
 
 	// Build target URL
@@ -363,7 +236,7 @@ func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 		return fmt.Errorf("failed to create proxy request: %v", err)
 	}
 
-	// Copy headers (excluding hop-by-hop headers)
+	// Copy headers
 	for name, values := range req.Header {
 		if !isHopByHopHeader(name) {
 			for _, value := range values {
@@ -376,32 +249,14 @@ func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 	proxyResp, err := client.Do(proxyReq)
 	if err != nil {
 		if !payload.ResponseSent() {
-			// Provide more specific error messages based on the type of error
-			var errorMsg string
-			var statusCode int
-
-			if strings.Contains(err.Error(), "no such host") {
-				errorMsg = "Host not found"
-				statusCode = http.StatusNotFound
-			} else if strings.Contains(err.Error(), "connection refused") {
-				errorMsg = "Connection refused"
-				statusCode = http.StatusBadGateway
-			} else if strings.Contains(err.Error(), "timeout") {
-				errorMsg = "Connection timeout"
-				statusCode = http.StatusGatewayTimeout
-			} else {
-				errorMsg = "Proxy request failed"
-				statusCode = http.StatusBadGateway
-			}
-
-			http.Error(resp, errorMsg, statusCode)
+			http.Error(resp, "Proxy request failed", http.StatusBadGateway)
 			payload.MarkResponseSent()
 		}
 		return fmt.Errorf("proxy request failed: %v", err)
 	}
 	defer proxyResp.Body.Close()
 
-	// Copy response headers (excluding hop-by-hop headers)
+	// Copy response headers
 	for name, values := range proxyResp.Header {
 		if !isHopByHopHeader(name) {
 			for _, value := range values {
@@ -418,55 +273,46 @@ func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 	return err
 }
 
-func (p *ProxyProcessor) dialWithBind(addr string, bindAddr *net.TCPAddr) (net.Conn, error) {
-	// IPv6-only to prevent IP leakage
-	if bindAddr.IP.To4() != nil {
-		return nil, fmt.Errorf("IPv4 bind address not allowed - IPv6 only")
-	}
-
+// Simple IPv6 dialer that enforces IPv6-only connections
+func (p *ProxyProcessor) dialWithIPv6(addr string, localIP net.IP) (net.Conn, error) {
 	// Parse target address
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid target address %s: %v", addr, err)
 	}
 
-	// Resolve target IP (force IPv6)
-	resolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{
-				Timeout: 10 * time.Second,
-				LocalAddr: &net.UDPAddr{
-					IP: bindAddr.IP,
-				},
-			}
-			// Force IPv6 DNS resolution
-			return d.DialContext(ctx, "udp6", address)
-		},
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	// Resolve IPv6 addresses only
-	ips, err := resolver.LookupIP(ctx, "ip6", host)
+	// Resolve all IPs (IPv4 and IPv6)
+	ips, err := net.LookupIP(host)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve %s (IPv6): %v", host, err)
+		return nil, fmt.Errorf("failed to resolve %s: %v", host, err)
 	}
 
-	if len(ips) == 0 {
+	// Find IPv6 addresses
+	var ipv6s []net.IP
+	for _, ip := range ips {
+		if ip.To4() == nil {
+			ipv6s = append(ipv6s, ip)
+		}
+	}
+
+	if len(ipv6s) == 0 {
 		return nil, fmt.Errorf("no IPv6 addresses found for %s", host)
 	}
 
-	// Get port number
+	// Parse port
 	portNum, err := strconv.Atoi(port)
 	if err != nil {
 		return nil, fmt.Errorf("invalid port %s: %v", port, err)
 	}
 
-	// Try each IP until one works
+	// Create bind address
+	bindAddr := &net.TCPAddr{
+		IP: localIP,
+	}
+
+	// Try each IPv6 address
 	var lastErr error
-	for _, ip := range ips {
+	for _, ip := range ipv6s {
 		targetAddr := &net.TCPAddr{
 			IP:   ip,
 			Port: portNum,
@@ -474,49 +320,27 @@ func (p *ProxyProcessor) dialWithBind(addr string, bindAddr *net.TCPAddr) (net.C
 
 		dialer := &net.Dialer{
 			LocalAddr: bindAddr,
-			Timeout:   20 * time.Second,
-			KeepAlive: 30 * time.Second,
-			Control:   nil, // No special socket options
+			Timeout:   10 * time.Second,
 		}
 
-		// Connect directly to the IPv6 address
 		conn, err := dialer.Dial("tcp6", targetAddr.String())
 		if err != nil {
 			lastErr = err
-			log.Printf("Failed to connect to %s (%s): %v, trying next IP...",
-				host, ip.String(), err)
 			continue
 		}
 
-		// Set TCP options for better performance
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			tcpConn.SetNoDelay(true)
-			tcpConn.SetKeepAlive(true)
-			tcpConn.SetKeepAlivePeriod(30 * time.Second)
-			// Larger buffers for better performance
-			tcpConn.SetReadBuffer(128 * 1024)  // 128KB
-			tcpConn.SetWriteBuffer(128 * 1024) // 128KB
-		}
-
-		log.Printf("Successfully connected to %s (%s)", host, ip.String())
+		log.Printf("Connected to %s (%s) via IPv6", host, ip.String())
 		return conn, nil
 	}
 
 	return nil, fmt.Errorf("failed to connect to any IPv6 address for %s: %v", host, lastErr)
 }
 
-// Helper function to parse port
-func parseInt(s string) int {
-	n, _ := strconv.Atoi(s)
-	return n
-}
-
-// isHopByHopHeader reports whether hdr is an RFC 2616 hop-by-hop header
+// isHopByHopHeader checks if a header should not be forwarded
 func isHopByHopHeader(name string) bool {
 	switch strings.ToLower(name) {
-	case "connection", "keep-alive", "proxy-authenticate",
-		"proxy-authorization", "te", "trailers", "transfer-encoding",
-		"upgrade":
+	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+		"te", "trailers", "transfer-encoding", "upgrade":
 		return true
 	}
 	return false
