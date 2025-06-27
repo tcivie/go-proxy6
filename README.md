@@ -1,6 +1,6 @@
 # IPv6 Proxy
 
-A high-performance HTTP/HTTPS proxy that routes traffic through random IPv6 addresses from your subnet.
+A high-performance HTTP (HTTPS Not supported yet) proxy that routes traffic through random IPv6 addresses from your subnet.
 
 ## Performance
 
