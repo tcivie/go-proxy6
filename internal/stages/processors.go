@@ -3,11 +3,11 @@ package stages
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"go-proxy6/internal/ipv6"
 	"go-proxy6/internal/pipeline"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -117,14 +117,17 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	target := payload.Target
 	bindAddr := payload.BindAddr
 	resp := payload.Response
+	req := payload.Request
 
-	// Enhanced connection to target with IPv6 binding
+	// Parse target for logging
+	targetHost, targetPort, _ := net.SplitHostPort(target)
+	log.Printf("CONNECT tunnel request: %s:%s", targetHost, targetPort)
+
+	// CONNECT to target with IPv6 binding
 	destConn, err := p.dialWithBind(target, bindAddr)
 	if err != nil {
 		if !payload.ResponseSent() {
-			// Send proper HTTP error response for CONNECT failures
-			resp.WriteHeader(http.StatusBadGateway)
-			resp.Write([]byte("502 Bad Gateway - Failed to connect to target"))
+			http.Error(resp, fmt.Sprintf("502 Bad Gateway - Failed to connect to %s", targetHost), http.StatusBadGateway)
 			payload.MarkResponseSent()
 		}
 		return fmt.Errorf("failed to connect to %s: %v", target, err)
@@ -135,8 +138,7 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	hijacker, ok := resp.(http.Hijacker)
 	if !ok {
 		if !payload.ResponseSent() {
-			resp.WriteHeader(http.StatusInternalServerError)
-			resp.Write([]byte("500 Internal Server Error - Hijacking not supported"))
+			http.Error(resp, "500 Internal Server Error - Hijacking not supported", http.StatusInternalServerError)
 			payload.MarkResponseSent()
 		}
 		return fmt.Errorf("hijacking not supported")
@@ -145,15 +147,15 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
 		if !payload.ResponseSent() {
-			resp.WriteHeader(http.StatusInternalServerError)
-			resp.Write([]byte("500 Internal Server Error - Failed to hijack connection"))
+			http.Error(resp, "500 Internal Server Error - Failed to hijack connection", http.StatusInternalServerError)
 			payload.MarkResponseSent()
 		}
 		return fmt.Errorf("failed to hijack connection: %v", err)
 	}
 	defer clientConn.Close()
 
-	// Send proper 200 Connection established response
+	// Critical: Send 200 Connection established BEFORE trying to set deadlines
+	// This is the proper HTTP/1.1 format for CONNECT response
 	connectResponse := "HTTP/1.1 200 Connection established\r\n\r\n"
 	_, err = clientConn.Write([]byte(connectResponse))
 	if err != nil {
@@ -161,33 +163,57 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	}
 	payload.MarkResponseSent()
 
-	// Set deadlines to prevent hangs
+	// Set realistic timeouts (these must be after the 200 response)
 	clientConn.SetDeadline(time.Now().Add(5 * time.Minute))
 	destConn.SetDeadline(time.Now().Add(5 * time.Minute))
 
-	// Bidirectional copy with proper error handling and larger buffers
+	// Create bidirectional pipe with proper buffer sizes
 	errChan := make(chan error, 2)
 
-	// Copy from client to destination with larger buffer
+	// Client to destination (increased buffer)
 	go func() {
-		buf := make([]byte, 65536)
+		buf := make([]byte, 64*1024) // 64KB buffer
 		_, err := io.CopyBuffer(destConn, clientConn, buf)
+		// EOF is expected when client closes connection
+		if err != nil && err != io.EOF {
+			log.Printf("Client to destination copy error: %v", err)
+		}
+		// Signal destination to close with TCP half-close
+		if tcpConn, ok := destConn.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		}
 		errChan <- err
 	}()
 
-	// Copy from destination to client with larger buffer
+	// Destination to client (increased buffer)
 	go func() {
-		buf := make([]byte, 65536)
+		buf := make([]byte, 64*1024) // 64KB buffer
 		_, err := io.CopyBuffer(clientConn, destConn, buf)
+		// EOF is expected when server closes connection
+		if err != nil && err != io.EOF {
+			log.Printf("Destination to client copy error: %v", err)
+		}
+		// Signal client to close with TCP half-close
+		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		}
 		errChan <- err
 	}()
 
-	// Wait for first error, context cancellation, or deadline
+	// Wait for either goroutine to finish or context cancellation
 	select {
 	case err := <-errChan:
-		// Ignore EOF errors which are normal when connections close
-		if err != nil && !errors.Is(err, io.EOF) {
+		// One direction finished, ignore normal EOF errors
+		if err != nil && err != io.EOF {
 			return err
+		}
+		// Wait for the other goroutine to finish or timeout
+		select {
+		case <-errChan:
+			// Both directions completed
+		case <-time.After(30 * time.Second):
+			// Timeout waiting for the other direction
+			log.Printf("Timeout waiting for tunnel completion")
 		}
 		return nil
 	case <-payload.Ctx.Done():
@@ -344,67 +370,79 @@ func (p *ProxyProcessor) dialWithBind(addr string, bindAddr *net.TCPAddr) (net.C
 		return nil, fmt.Errorf("invalid target address %s: %v", addr, err)
 	}
 
-	// Look up host (IPv6 only)
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve %s: %v", host, err)
+	// Resolve target IP (force IPv6)
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{
+				Timeout: 10 * time.Second,
+				LocalAddr: &net.UDPAddr{
+					IP: bindAddr.IP,
+				},
+			}
+			// Force IPv6 DNS resolution
+			return d.DialContext(ctx, "udp6", address)
+		},
 	}
 
-	// Find an IPv6 address
-	var targetIP net.IP
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Resolve IPv6 addresses only
+	ips, err := resolver.LookupIP(ctx, "ip6", host)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve %s (IPv6): %v", host, err)
+	}
+
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no IPv6 addresses found for %s", host)
+	}
+
+	// Get port number
+	portNum, err := strconv.Atoi(port)
+	if err != nil {
+		return nil, fmt.Errorf("invalid port %s: %v", port, err)
+	}
+
+	// Try each IP until one works
+	var lastErr error
 	for _, ip := range ips {
-		if ip.To4() == nil {
-			targetIP = ip
-			break
+		targetAddr := &net.TCPAddr{
+			IP:   ip,
+			Port: portNum,
 		}
+
+		dialer := &net.Dialer{
+			LocalAddr: bindAddr,
+			Timeout:   20 * time.Second,
+			KeepAlive: 30 * time.Second,
+			Control:   nil, // No special socket options
+		}
+
+		// Connect directly to the IPv6 address
+		conn, err := dialer.Dial("tcp6", targetAddr.String())
+		if err != nil {
+			lastErr = err
+			log.Printf("Failed to connect to %s (%s): %v, trying next IP...",
+				host, ip.String(), err)
+			continue
+		}
+
+		// Set TCP options for better performance
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetNoDelay(true)
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetKeepAlivePeriod(30 * time.Second)
+			// Larger buffers for better performance
+			tcpConn.SetReadBuffer(128 * 1024)  // 128KB
+			tcpConn.SetWriteBuffer(128 * 1024) // 128KB
+		}
+
+		log.Printf("Successfully connected to %s (%s)", host, ip.String())
+		return conn, nil
 	}
 
-	if targetIP == nil {
-		return nil, fmt.Errorf("no IPv6 address found for %s", host)
-	}
-
-	// Create target address
-	targetAddr := &net.TCPAddr{
-		IP:   targetIP,
-		Port: parseInt(port),
-	}
-
-	// Special handling for known problematic sites
-	var connectTimeout time.Duration = 15 * time.Second
-	if strings.Contains(host, "ipv6-test.com") ||
-		strings.Contains(host, "test-ipv6.com") {
-		// These sites often need more time or special handling
-		connectTimeout = 25 * time.Second
-	}
-
-	// Enhanced dialer with extended timeouts
-	dialer := &net.Dialer{
-		LocalAddr: bindAddr,
-		Timeout:   connectTimeout,
-		KeepAlive: 30 * time.Second,
-		DualStack: false, // Force IPv6 only
-	}
-
-	// Connect directly to the IPv6 address
-	conn, err := dialer.Dial("tcp6", targetAddr.String())
-	if err != nil {
-		// Provide detailed error info for debugging
-		return nil, fmt.Errorf("IPv6 connection to %s (%s) failed: %v",
-			host, targetIP, err)
-	}
-
-	// Configure TCP options for better performance
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true)
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-
-		// Add larger buffers for better performance
-		tcpConn.SetReadBuffer(65536)
-		tcpConn.SetWriteBuffer(65536)
-	}
-
-	return conn, nil
+	return nil, fmt.Errorf("failed to connect to any IPv6 address for %s: %v", host, lastErr)
 }
 
 // Helper function to parse port
