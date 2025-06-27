@@ -117,7 +117,6 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	target := payload.Target
 	bindAddr := payload.BindAddr
 	resp := payload.Response
-	req := payload.Request
 
 	// Parse target for logging
 	targetHost, targetPort, _ := net.SplitHostPort(target)
