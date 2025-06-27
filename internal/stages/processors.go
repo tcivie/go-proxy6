@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -118,108 +119,168 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	bindAddr := payload.BindAddr
 	resp := payload.Response
 
-	// Parse target for logging
-	targetHost, targetPort, _ := net.SplitHostPort(target)
-	log.Printf("CONNECT tunnel request: %s:%s", targetHost, targetPort)
+	// Log the CONNECT request
+	log.Printf("CONNECT request to: %s via IPv6: %s", target, bindAddr.IP.String())
 
-	// CONNECT to target with IPv6 binding
-	destConn, err := p.dialWithBind(target, bindAddr)
-	if err != nil {
-		if !payload.ResponseSent() {
-			http.Error(resp, fmt.Sprintf("502 Bad Gateway - Failed to connect to %s", targetHost), http.StatusBadGateway)
-			payload.MarkResponseSent()
-		}
-		return fmt.Errorf("failed to connect to %s: %v", target, err)
-	}
-	defer destConn.Close()
-
-	// Hijack the client connection
+	// First, hijack the client connection
 	hijacker, ok := resp.(http.Hijacker)
 	if !ok {
 		if !payload.ResponseSent() {
-			http.Error(resp, "500 Internal Server Error - Hijacking not supported", http.StatusInternalServerError)
+			http.Error(resp, "Hijacking not supported", http.StatusInternalServerError)
 			payload.MarkResponseSent()
 		}
 		return fmt.Errorf("hijacking not supported")
 	}
 
-	clientConn, _, err := hijacker.Hijack()
+	clientConn, clientBuf, err := hijacker.Hijack()
 	if err != nil {
 		if !payload.ResponseSent() {
-			http.Error(resp, "500 Internal Server Error - Failed to hijack connection", http.StatusInternalServerError)
+			http.Error(resp, "Failed to hijack connection", http.StatusInternalServerError)
 			payload.MarkResponseSent()
 		}
 		return fmt.Errorf("failed to hijack connection: %v", err)
 	}
 	defer clientConn.Close()
 
-	// Critical: Send 200 Connection established BEFORE trying to set deadlines
-	// This is the proper HTTP/1.1 format for CONNECT response
-	connectResponse := "HTTP/1.1 200 Connection established\r\n\r\n"
-	_, err = clientConn.Write([]byte(connectResponse))
-	if err != nil {
-		return fmt.Errorf("failed to send CONNECT response: %v", err)
+	// Create context with timeout for connection
+	connCtx, connCancel := context.WithTimeout(payload.Ctx, 30*time.Second)
+	defer connCancel()
+
+	// Connect to the target with IPv6 binding
+	dialer := &net.Dialer{
+		LocalAddr: bindAddr,
+		Timeout:   20 * time.Second,
+		KeepAlive: 30 * time.Second,
 	}
+
+	// Parse the target address for logging
+	host, port, _ := net.SplitHostPort(target)
+	log.Printf("Establishing CONNECT tunnel to %s:%s", host, port)
+
+	// Connect to the target
+	destConn, err := dialer.DialContext(connCtx, "tcp6", target)
+	if err != nil {
+		// Send error response if we haven't already
+		if !payload.ResponseSent() {
+			clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"))
+			payload.MarkResponseSent()
+		}
+		return fmt.Errorf("failed to connect to target %s: %v", target, err)
+	}
+	defer destConn.Close()
+
+	// Set reasonable buffer sizes
+	if tcpConn, ok := destConn.(*net.TCPConn); ok {
+		tcpConn.SetReadBuffer(65536)
+		tcpConn.SetWriteBuffer(65536)
+		tcpConn.SetNoDelay(true)
+	}
+
+	// Mark the response as sent to prevent Go from sending another response
 	payload.MarkResponseSent()
 
-	// Set realistic timeouts (these must be after the 200 response)
-	clientConn.SetDeadline(time.Now().Add(5 * time.Minute))
-	destConn.SetDeadline(time.Now().Add(5 * time.Minute))
+	// Send the 200 Connection Established response
+	// This is the MOST CRITICAL part - it must be exactly in this format
+	success := "HTTP/1.1 200 Connection established\r\n\r\n"
+	if _, err := clientConn.Write([]byte(success)); err != nil {
+		return fmt.Errorf("failed to send 200 response: %v", err)
+	}
 
-	// Create bidirectional pipe with proper buffer sizes
-	errChan := make(chan error, 2)
+	log.Printf("CONNECT tunnel established to %s", target)
 
-	// Client to destination (increased buffer)
+	// Flush any buffered data from hijacked connection to the target
+	if clientBuf.Reader.Buffered() > 0 {
+		buf := make([]byte, clientBuf.Reader.Buffered())
+		clientBuf.Reader.Read(buf)
+		destConn.Write(buf)
+	}
+
+	// Use a WaitGroup to manage our goroutines
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Copy from client to target
 	go func() {
-		buf := make([]byte, 64*1024) // 64KB buffer
-		_, err := io.CopyBuffer(destConn, clientConn, buf)
-		// EOF is expected when client closes connection
-		if err != nil && err != io.EOF {
-			log.Printf("Client to destination copy error: %v", err)
+		defer wg.Done()
+		buf := make([]byte, 65536)
+		for {
+			// Set a read deadline
+			clientConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+
+			n, err := clientConn.Read(buf)
+			if n > 0 {
+				// Set a write deadline
+				destConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+				if _, err := destConn.Write(buf[:n]); err != nil {
+					log.Printf("Error writing to target: %v", err)
+					break
+				}
+			}
+			if err != nil {
+				if err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
+					log.Printf("Error reading from client: %v", err)
+				}
+				break
+			}
 		}
-		// Signal destination to close with TCP half-close
+
+		// Signal the server we're done writing
 		if tcpConn, ok := destConn.(*net.TCPConn); ok {
 			tcpConn.CloseWrite()
+		} else {
+			destConn.Close()
 		}
-		errChan <- err
 	}()
 
-	// Destination to client (increased buffer)
+	// Copy from target to client
 	go func() {
-		buf := make([]byte, 64*1024) // 64KB buffer
-		_, err := io.CopyBuffer(clientConn, destConn, buf)
-		// EOF is expected when server closes connection
-		if err != nil && err != io.EOF {
-			log.Printf("Destination to client copy error: %v", err)
+		defer wg.Done()
+		buf := make([]byte, 65536)
+		for {
+			// Set a read deadline
+			destConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+
+			n, err := destConn.Read(buf)
+			if n > 0 {
+				// Set a write deadline
+				clientConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+				if _, err := clientConn.Write(buf[:n]); err != nil {
+					log.Printf("Error writing to client: %v", err)
+					break
+				}
+			}
+			if err != nil {
+				if err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
+					log.Printf("Error reading from target: %v", err)
+				}
+				break
+			}
 		}
-		// Signal client to close with TCP half-close
+
+		// Signal the client we're done writing
 		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
 			tcpConn.CloseWrite()
+		} else {
+			clientConn.Close()
 		}
-		errChan <- err
 	}()
 
-	// Wait for either goroutine to finish or context cancellation
+	// Wait for copying to complete or context to be canceled
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
 	select {
-	case err := <-errChan:
-		// One direction finished, ignore normal EOF errors
-		if err != nil && err != io.EOF {
-			return err
-		}
-		// Wait for the other goroutine to finish or timeout
-		select {
-		case <-errChan:
-			// Both directions completed
-		case <-time.After(30 * time.Second):
-			// Timeout waiting for the other direction
-			log.Printf("Timeout waiting for tunnel completion")
-		}
+	case <-done:
+		log.Printf("CONNECT tunnel closed normally for %s", target)
 		return nil
 	case <-payload.Ctx.Done():
+		log.Printf("CONNECT tunnel closed due to context cancellation for %s", target)
 		return payload.Ctx.Err()
 	}
 }
-
 func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 	req := payload.Request
 	resp := payload.Response
