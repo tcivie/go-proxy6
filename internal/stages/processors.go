@@ -54,6 +54,7 @@ func (p *TargetProcessor) Process(ctx context.Context, payload pipeline.Payload)
 
 	var target string
 	if req.Method == http.MethodConnect {
+		// CONNECT method for HTTPS tunneling
 		target = req.Host
 		if !strings.Contains(target, ":") {
 			target += ":443" // HTTPS default
@@ -115,11 +116,13 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	bindAddr := payload.BindAddr
 	resp := payload.Response
 
-	// Connect to target with binding
+	// FIXED: Connect to target with IPv6 binding
 	destConn, err := p.dialWithBind(target, bindAddr)
 	if err != nil {
 		if !payload.ResponseSent() {
-			http.Error(resp, fmt.Sprintf("Failed to connect to %s", target), http.StatusBadGateway)
+			// Send proper HTTP error response for CONNECT failures
+			resp.WriteHeader(http.StatusBadGateway)
+			resp.Write([]byte("502 Bad Gateway - Failed to connect to target"))
 			payload.MarkResponseSent()
 		}
 		return fmt.Errorf("failed to connect to %s: %v", target, err)
@@ -130,7 +133,8 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	hijacker, ok := resp.(http.Hijacker)
 	if !ok {
 		if !payload.ResponseSent() {
-			http.Error(resp, "Hijacking not supported", http.StatusInternalServerError)
+			resp.WriteHeader(http.StatusInternalServerError)
+			resp.Write([]byte("500 Internal Server Error - Hijacking not supported"))
 			payload.MarkResponseSent()
 		}
 		return fmt.Errorf("hijacking not supported")
@@ -139,25 +143,43 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
 		if !payload.ResponseSent() {
-			http.Error(resp, "Failed to hijack connection", http.StatusInternalServerError)
+			resp.WriteHeader(http.StatusInternalServerError)
+			resp.Write([]byte("500 Internal Server Error - Failed to hijack connection"))
 			payload.MarkResponseSent()
 		}
 		return fmt.Errorf("failed to hijack connection: %v", err)
 	}
 	defer clientConn.Close()
 
-	// Send connection established response
-	clientConn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+	// FIXED: Send proper 200 Connection established response
+	connectResponse := "HTTP/1.1 200 Connection established\r\n\r\n"
+	_, err = clientConn.Write([]byte(connectResponse))
+	if err != nil {
+		return fmt.Errorf("failed to send CONNECT response: %v", err)
+	}
 	payload.MarkResponseSent()
 
-	// Bidirectional copy
+	// FIXED: Bidirectional copy with proper error handling
 	errChan := make(chan error, 2)
-	go p.copyData(destConn, clientConn, errChan)
-	go p.copyData(clientConn, destConn, errChan)
+
+	// Copy from client to destination
+	go func() {
+		_, err := io.Copy(destConn, clientConn)
+		errChan <- err
+	}()
+
+	// Copy from destination to client
+	go func() {
+		_, err := io.Copy(clientConn, destConn)
+		errChan <- err
+	}()
 
 	// Wait for first error or context cancellation
 	select {
 	case err := <-errChan:
+		// One direction finished/failed, close connections to stop the other
+		clientConn.Close()
+		destConn.Close()
 		return err
 	case <-payload.Ctx.Done():
 		return payload.Ctx.Err()
@@ -289,29 +311,38 @@ func (p *ProxyProcessor) dialWithBind(addr string, bindAddr *net.TCPAddr) (net.C
 		return nil, fmt.Errorf("IPv4 bind address not allowed - IPv6 only")
 	}
 
+	// FIXED: Improved dialer with better error handling
 	dialer := &net.Dialer{
 		LocalAddr: &net.TCPAddr{
 			IP: bindAddr.IP,
 		},
-		Timeout:   10 * time.Second,
+		Timeout:   15 * time.Second, // Increased timeout for stability
 		KeepAlive: 30 * time.Second,
 	}
 
-	// Force IPv6-only connection
+	// Force IPv6-only connection - try tcp6 first, then tcp
 	conn, err := dialer.Dial("tcp6", addr)
 	if err != nil {
-		// More detailed logging for debugging
-		fmt.Printf("IPv6 dial failed - Request: %s, Local: %s, Target: %s, Error: %v\n",
-			"", bindAddr.IP.String(), addr, err)
-		return nil, fmt.Errorf("IPv6 connection failed: %v", err)
+		// Fallback to tcp (but still with IPv6 bind)
+		conn, err = dialer.Dial("tcp", addr)
+		if err != nil {
+			// Enhanced logging for debugging
+			fmt.Printf("IPv6 dial failed - Local: %s, Target: %s, Error: %v\n",
+				bindAddr.IP.String(), addr, err)
+			return nil, fmt.Errorf("IPv6 connection failed: %v", err)
+		}
+	}
+
+	// SECURITY: Double-check that connection is actually IPv6
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		remoteAddr := tcpConn.RemoteAddr().(*net.TCPAddr)
+		if remoteAddr.IP.To4() != nil {
+			conn.Close()
+			return nil, fmt.Errorf("security violation: connected to IPv4 address %s", remoteAddr.IP)
+		}
 	}
 
 	return conn, nil
-}
-
-func (p *ProxyProcessor) copyData(dst, src net.Conn, errChan chan error) {
-	_, err := io.Copy(dst, src)
-	errChan <- err
 }
 
 // isHopByHopHeader reports whether hdr is an RFC 2616 hop-by-hop header
