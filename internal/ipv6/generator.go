@@ -35,6 +35,10 @@ func (g *Generator) randomIP() (net.IP, error) {
 		return nil, err
 	}
 
+	if err := g.validateBaseIP(); err != nil {
+		return nil, err
+	}
+
 	randomBytes, err := generateRandomBytes(g.hostBytes())
 	if err != nil {
 		return nil, err
@@ -48,6 +52,14 @@ func (g *Generator) validateMask() error {
 	_, bits := g.network.Mask.Size()
 	if bits != 128 {
 		return fmt.Errorf("invalid IPv6 mask")
+	}
+	return nil
+}
+
+// validateBaseIP checks if the base IP belongs to the specified network.
+func (g *Generator) validateBaseIP() error {
+	if !g.network.Contains(g.base) {
+		return fmt.Errorf("base IP %v does not belong to network %v", g.base, g.network)
 	}
 	return nil
 }

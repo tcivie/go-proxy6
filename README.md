@@ -8,9 +8,9 @@ Our optimized single-worker pipeline delivers exceptional performance:
 
 ```
 Benchmark Results (Apple M2):
-├── Throughput: 255,000 requests/second
-├── Latency: 3.9μs per request
-├── Memory: 1,625 B/op, 41 allocs/op
+├── Throughput: 253,614 requests/second
+├── Latency: 3.94μs per request
+├── Memory: 1,705 B/op, 45 allocs/op
 └── Goroutines: Only 3 total
 ```
 
@@ -20,18 +20,19 @@ The proxy uses a high-performance pipeline with the following stages:
 
 ```
 HTTP Request → IPv6Generator → TargetResolver → RequestExecutor → Response
-                (560ns)         (460ns)          (2,895ns)
+                (511ns)         (459ns)          (2,973ns)
 ```
 
 **Stage Breakdown:**
-- **IPv6Generator** (14.3%): Generates random IPv6 addresses from your subnet
-- **TargetResolver** (11.8%): Resolves target host and validates request
-- **RequestExecutor** (73.9%): Handles the actual HTTP proxy request with IPv6 binding
+- **IPv6Generator** (13.0%): Generates random IPv6 addresses from your subnet with validation
+- **TargetResolver** (11.6%): Resolves target host and validates request
+- **RequestExecutor** (75.4%): Handles the actual HTTP proxy request with IPv6 binding
 
 **Key Optimizations:**
 - ✅ **Single worker design** - eliminates context switching overhead
 - ✅ **Buffered channels** - reduces blocking with 10-slot request buffer  
-- ✅ **Minimal allocations** - only 41 allocations per request
+- ✅ **Minimal allocations** - only 45 allocations per request
+- ✅ **Input validation** - ensures base IP belongs to specified network
 - ✅ **Concurrent I/O** - each proxy request spawns dedicated goroutines for data transfer
 
 This architecture ensures **sub-millisecond pipeline overhead** while your actual network requests happen in parallel.
@@ -129,4 +130,3 @@ go test -bench=BenchmarkPipelineStages ./internal/proxy/
 ```
 
 The benchmarks use mocked network calls to measure pure pipeline performance without network I/O variability.
-```
