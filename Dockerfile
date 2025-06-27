@@ -1,16 +1,9 @@
 # Build stage
 FROM golang:1.24-alpine AS builder
-
 WORKDIR /app
-
-# Copy go mod files first for better caching
-COPY go.mod go.sum* ./
+COPY go.mod ./
 RUN go mod download
-
-# Copy source code
 COPY . .
-
-# Build the binary
 RUN CGO_ENABLED=0 GOOS=linux go build -o ipv6-proxy main.go
 
 # Runtime stage
@@ -22,33 +15,30 @@ RUN apk --no-cache add iproute2 curl
 WORKDIR /app
 COPY --from=builder /app/ipv6-proxy .
 
-# Default configuration (override with environment variables)
+# Default subnet (override with -e SUBNET=your_subnet)
 ENV SUBNET="2a01:4f9:c012:83eb::/64"
 ENV BIND="0.0.0.0:8080"
-ENV WORKERS=""
+ENV WORKERS="50"
 
 # Setup script that configures IPv6 and starts proxy
-RUN <<'EOT' cat > /app/start.sh
+COPY <<EOF /app/start.sh
 #!/bin/sh
 set -e
 
-echo "Configuring IPv6 for subnet: $SUBNET"
+echo "Configuring IPv6 for subnet: \$SUBNET"
 
-# Get the main interface (simpler approach)
-INTERFACE=$(ip route | grep default | awk '{print $5}')
+# Extract interface name (usually eth0 in container)
+INTERFACE=\$(ip route | grep default | awk '{print \$5}' | head -n1)
+echo "Using interface: \$INTERFACE"
 
-echo "Using interface: $INTERFACE"
+# Enable non-local bind
+sysctl net.ipv6.ip_nonlocal_bind=1
 
-# Enable IPv6
-sysctl -w net.ipv6.conf.all.forwarding=1
-sysctl -w net.ipv6.ip_nonlocal_bind=1
+# Add local route for the subnet
+ip route add local \$SUBNET dev \$INTERFACE 2>/dev/null || echo "Route already exists"
 
-# Add route for the subnet
-ip -6 route add local $SUBNET dev $INTERFACE 2>/dev/null || true
-
-# Start the proxy
-exec ./ipv6-proxy -bind=$BIND -subnet=$SUBNET
-EOT
+exec ./ipv6-proxy -bind="\$BIND" -subnet="\$SUBNET" -workers=\$WORKERS
+EOF
 
 RUN chmod +x /app/start.sh
 
