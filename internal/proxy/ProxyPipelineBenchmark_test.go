@@ -20,9 +20,8 @@ import (
 	"go.uber.org/mock/gomock"
 )
 
-// Enhanced benchmark with detailed metrics
 func BenchmarkProxyPipelineDetailed(b *testing.B) {
-	// Disable logging
+	// Setup - this will be automatically excluded from timing by B.Loop
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.Level(1000),
 	})))
@@ -58,8 +57,8 @@ func BenchmarkProxyPipelineDetailed(b *testing.B) {
 		b.Fatalf("Failed to create HTTP request: %v", err)
 	}
 
-	// Warm up
-	for i := 0; i < 1000; i++ {
+	// Warm up - excluded from timing by B.Loop
+	for i := 0; i < 100; i++ {
 		ctx := context.Background()
 		pipelineReq := &pipeline.Request{
 			ID:   fmt.Sprintf("warmup-%d", i),
@@ -71,13 +70,84 @@ func BenchmarkProxyPipelineDetailed(b *testing.B) {
 		<-pipelineReq.Done
 	}
 
-	// Reset counters after warmup
 	atomic.StoreInt64(&processedCount, 0)
-
-	b.ResetTimer()
 	b.ReportAllocs()
 
-	start := time.Now()
+	var totalRequests int64
+	startTime := time.Now()
+
+	// B.Loop automatically handles timing and prevents dead code elimination
+	for b.Loop() {
+		ctx := context.Background()
+		pipelineReq := &pipeline.Request{
+			ID:   "bench-request",
+			Ctx:  ctx,
+			Done: make(chan error, 1),
+			Data: &pipeline.RequestData{HTTPReq: httpReq},
+		}
+
+		pipe.Process(pipelineReq)
+		select {
+		case err := <-pipelineReq.Done:
+			if err != nil {
+				b.Fatalf("Unexpected pipeline error: %v", err)
+			}
+			totalRequests++
+		case <-time.After(time.Second):
+			b.Fatalf("Pipeline processing timed out")
+		}
+	}
+
+	// Report custom metrics - excluded from timing by B.Loop
+	elapsed := time.Since(startTime)
+	processed := atomic.LoadInt64(&processedCount)
+
+	if elapsed > 0 && processed > 0 {
+		reqPerSec := float64(processed) / elapsed.Seconds()
+		nsPerReq := float64(elapsed.Nanoseconds()) / float64(processed)
+
+		b.ReportMetric(reqPerSec, "req/sec")
+		b.ReportMetric(nsPerReq, "ns/req")
+	}
+	b.ReportMetric(float64(runtime.NumGoroutine()), "goroutines")
+}
+
+// Parallel benchmark using B.Loop
+func BenchmarkProxyPipelineParallel(b *testing.B) {
+	// Setup
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.Level(1000),
+	})))
+
+	ctrl := gomock.NewController(b)
+	defer ctrl.Finish()
+
+	mockExecutor := mocks.NewMockStage(ctrl)
+	mockExecutor.EXPECT().Name().Return("MockRequestExecutor").AnyTimes()
+	mockExecutor.EXPECT().Process(gomock.Any()).Return(nil).AnyTimes()
+
+	cfg, err := config.New("127.0.0.1:8080", "2001:19f0:6001:48e4::/64")
+	if err != nil {
+		b.Fatalf("Failed to create config: %v", err)
+	}
+
+	gen := ipv6.NewGenerator(cfg.IPv6Net, cfg.IPv6Base)
+	pipe := pipeline.New(
+		stages.NewIPv6Generator(gen),
+		stages.NewTargetResolver(),
+		mockExecutor,
+	)
+
+	pipe.Start()
+	defer pipe.Stop()
+
+	httpReq, err := http.NewRequest(http.MethodGet, "http://example.com", nil)
+	if err != nil {
+		b.Fatalf("Failed to create HTTP request: %v", err)
+	}
+
+	b.ReportAllocs()
+
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			ctx := context.Background()
@@ -99,18 +169,11 @@ func BenchmarkProxyPipelineDetailed(b *testing.B) {
 			}
 		}
 	})
-
-	elapsed := time.Since(start)
-	processed := atomic.LoadInt64(&processedCount)
-
-	// Custom metrics
-	b.ReportMetric(float64(processed)/elapsed.Seconds(), "req/sec")
-	b.ReportMetric(float64(elapsed.Nanoseconds())/float64(processed), "ns/req")
-	b.ReportMetric(float64(runtime.NumGoroutine()), "goroutines")
 }
 
-// Benchmark pipeline stages individually
+// Benchmark pipeline stages individually using B.Loop
 func BenchmarkPipelineStages(b *testing.B) {
+	// Setup
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.Level(1000),
 	})))
@@ -121,22 +184,26 @@ func BenchmarkPipelineStages(b *testing.B) {
 
 	b.Run("IPv6Generator", func(b *testing.B) {
 		stage := stages.NewIPv6Generator(gen)
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
+
+		for b.Loop() {
 			req := &pipeline.Request{
 				ID:   "test",
 				Ctx:  context.Background(),
 				Data: &pipeline.RequestData{HTTPReq: httpReq},
 				Done: make(chan error, 1),
 			}
-			stage.Process(req)
+			err := stage.Process(req)
+			// Ensure the result is used to prevent dead code elimination
+			if err != nil {
+				b.Fatal(err)
+			}
 		}
 	})
 
 	b.Run("TargetResolver", func(b *testing.B) {
 		stage := stages.NewTargetResolver()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
+
+		for b.Loop() {
 			req := &pipeline.Request{
 				ID:  "test",
 				Ctx: context.Background(),
@@ -146,13 +213,18 @@ func BenchmarkPipelineStages(b *testing.B) {
 				},
 				Done: make(chan error, 1),
 			}
-			stage.Process(req)
+			err := stage.Process(req)
+			// Ensure the result is used to prevent dead code elimination
+			if err != nil {
+				b.Fatal(err)
+			}
 		}
 	})
 }
 
-// Benchmark memory usage and allocations
+// Benchmark memory usage and allocations using B.Loop
 func BenchmarkProxyPipelineMemory(b *testing.B) {
+	// Setup
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.Level(1000),
 	})))
@@ -172,10 +244,9 @@ func BenchmarkProxyPipelineMemory(b *testing.B) {
 
 	httpReq, _ := http.NewRequest(http.MethodGet, "http://example.com", nil)
 
-	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		ctx := context.Background()
 		pipelineReq := &pipeline.Request{
 			ID:   "test-id",
@@ -185,6 +256,10 @@ func BenchmarkProxyPipelineMemory(b *testing.B) {
 		}
 
 		pipe.Process(pipelineReq)
-		<-pipelineReq.Done
+		err := <-pipelineReq.Done
+		// Ensure the result is used to prevent dead code elimination
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
 }

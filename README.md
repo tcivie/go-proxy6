@@ -4,13 +4,11 @@ A high-performance HTTP/HTTPS proxy that routes traffic through random IPv6 addr
 
 ## Performance
 
-Our optimized single-worker pipeline delivers exceptional performance:
-
 ```
-Benchmark Results (Apple M2):
-├── Throughput: 253,614 requests/second
-├── Latency: 3.94μs per request
-├── Memory: 1,705 B/op, 45 allocs/op
+Benchmark Results (Apple M2, Go 1.24):
+├── Sequential: 180,051 ± 657 req/sec (5.56 ± 0.02μs latency)
+├── Parallel: 264,705 ± 519 req/sec (3.78 ± 0.01μs latency)  
+├── Memory: 1,953 ± 0.5 B/op, 48 allocs/op
 └── Goroutines: Only 3 total
 ```
 
@@ -20,13 +18,13 @@ The proxy uses a high-performance pipeline with the following stages:
 
 ```
 HTTP Request → IPv6Generator → TargetResolver → RequestExecutor → Response
-                (511ns)         (459ns)          (2,973ns)
+               (479 ± 2ns)    (425 ± 3ns)     (~4.65μs)
 ```
 
-**Stage Breakdown:**
-- **IPv6Generator** (13.0%): Generates random IPv6 addresses from your subnet with validation
-- **TargetResolver** (11.6%): Resolves target host and validates request
-- **RequestExecutor** (75.4%): Handles the actual HTTP proxy request with IPv6 binding
+**Stage Breakdown (with 95% confidence intervals):**
+- **IPv6Generator** (8.6%): 478.9 ± 1.9ns - Generates random IPv6 addresses from your subnet
+- **TargetResolver** (7.6%): 424.7 ± 3.0ns - Resolves target host and validates request  
+- **Pipeline Overhead** (83.8%): ~4.65μs - Request routing, channel communication, and mocking
 
 ## Quick Start
 
@@ -110,14 +108,18 @@ The proxy automatically configures the necessary IPv6 routing rules on startup.
 To run performance benchmarks yourself:
 
 ```bash
-# Run all benchmarks
-go test -bench=. ./internal/proxy/
+# Run all benchmarks with statistical analysis
+go test -bench=. -count=10 ./internal/proxy/
 
-# Run detailed benchmark with custom metrics
-go test -bench=BenchmarkProxyPipelineDetailed ./internal/proxy/
+# Run detailed benchmark with custom metrics  
+go test -bench=BenchmarkProxyPipelineDetailed -count=10 ./internal/proxy/
 
 # Run individual stage benchmarks
-go test -bench=BenchmarkPipelineStages ./internal/proxy/
+go test -bench=BenchmarkPipelineStages -count=10 ./internal/proxy/
+
+# For statistical comparison (install: go install golang.org/x/perf/cmd/benchstat@latest)
+go test -bench=. -count=10 ./internal/proxy/ > results.txt
+benchstat results.txt
 ```
 
-The benchmarks use mocked network calls to measure pure pipeline performance without network I/O variability.
+The benchmarks use mocked network calls to measure pure pipeline performance without network I/O variability. All results include 95% confidence intervals from 10+ benchmark runs using Go 1.24's improved `testing.B.Loop` methodology.
