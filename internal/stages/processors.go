@@ -117,8 +117,16 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	bindAddr := payload.BindAddr
 	resp := payload.Response
 
-	// Connect to target
-	targetConn, err := p.dialWithIPv6(target, bindAddr.IP)
+	log.Printf("CONNECT request to: %s via IPv6: %s", target, bindAddr.IP.String())
+
+	// Connect to target using our IPv6 address
+	dialer := &net.Dialer{
+		LocalAddr: bindAddr,
+		Timeout:   10 * time.Second,
+	}
+
+	// Direct connection to target through IPv6
+	targetConn, err := dialer.Dial("tcp6", target)
 	if err != nil {
 		if !payload.ResponseSent() {
 			http.Error(resp, "Failed to connect to target", http.StatusBadGateway)
@@ -127,6 +135,9 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 		return fmt.Errorf("failed to connect to %s: %v", target, err)
 	}
 	defer targetConn.Close()
+
+	// Log successful connection
+	log.Printf("Successfully connected to %s", target)
 
 	// Hijack client connection
 	hijacker, ok := resp.(http.Hijacker)
@@ -196,7 +207,12 @@ func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 	// Create a simple transport with IPv6 dialer
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return p.dialWithIPv6(addr, bindAddr.IP)
+			// Force IPv6-only connections using our bind address
+			dialer := &net.Dialer{
+				LocalAddr: bindAddr,
+				Timeout:   10 * time.Second,
+			}
+			return dialer.Dial("tcp6", addr)
 		},
 		// Basic TLS config
 		TLSClientConfig: &tls.Config{
