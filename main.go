@@ -13,7 +13,7 @@ import (
 
 func main() {
 	var (
-		bindAddr   = flag.String("bind", "0.0.0.0:8080", "Proxy bind address")
+		bindAddr   = flag.String("bind", "localhost:8080", "Proxy bind address")
 		ipv6Subnet = flag.String("subnet", "2001:19f0:6001:48e4::/64", "IPv6 subnet")
 		workers    = flag.Int("workers", runtime.NumCPU()*2, "Max number of workers")
 		showHelp   = flag.Bool("help", false, "Show help")

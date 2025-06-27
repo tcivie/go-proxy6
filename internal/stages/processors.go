@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"go-proxy6/internal/ipv6"
 	"go-proxy6/internal/pipeline"
+	"go-proxy6/internal/util"
 	"io"
 	"log"
 	"net"
@@ -170,18 +171,34 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	clientConn.SetDeadline(time.Now().Add(5 * time.Minute))
 	targetConn.SetDeadline(time.Now().Add(5 * time.Minute))
 
+	// Create a TLS connection to the target
+	cert, err := util.GenerateSelfSignedCert()
+	if err != nil {
+		return fmt.Errorf("failed to generate certificate: %v", err)
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		// Add any other necessary TLS configurations
+	}
+
+	tlsConn := tls.Client(targetConn, tlsConfig)
+	if err := tlsConn.Handshake(); err != nil {
+		return fmt.Errorf("TLS handshake failed: %v", err)
+	}
+
 	// Create bidirectional tunnel
 	errCh := make(chan error, 2)
 
 	// Copy from client to target
 	go func() {
-		_, err := io.Copy(targetConn, clientConn)
+		_, err := io.Copy(tlsConn, clientConn)
 		errCh <- err
 	}()
 
 	// Copy from target to client
 	go func() {
-		_, err := io.Copy(clientConn, targetConn)
+		_, err := io.Copy(clientConn, tlsConn)
 		errCh <- err
 	}()
 
