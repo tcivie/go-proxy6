@@ -65,7 +65,7 @@ func (s *Server) Start() error {
 	go s.processRequests()
 
 	// Setup HTTP handlers
-	http.HandleFunc("/", s.handleRequest)
+	http.Handle("/", http.HandlerFunc(s.handleRequest))
 
 	log.Printf("Starting high-performance IPv6 proxy on %s", s.config.BindAddr)
 	log.Printf("IPv6 subnet: %s", s.config.IPv6Subnet)
