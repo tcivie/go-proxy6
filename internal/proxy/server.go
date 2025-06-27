@@ -81,7 +81,6 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Incoming request: %s %s -> %s", r.Method, r.Host, r.RequestURI)
 	// Create request-specific context with timeout (separate from server context)
 	requestCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
