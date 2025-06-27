@@ -3,7 +3,6 @@ package ipv6
 import (
 	"crypto/rand"
 	"fmt"
-	"log/slog"
 	"net"
 )
 
@@ -22,7 +21,6 @@ func NewGenerator(network *net.IPNet, base net.IP) *Generator {
 func (g *Generator) RandomAddr() (*net.TCPAddr, error) {
 	ip, err := g.randomIP()
 	if err != nil {
-		slog.Error("Failed to generate random IP", "error", err.Error())
 		return nil, err
 	}
 

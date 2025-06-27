@@ -32,7 +32,7 @@ func BenchmarkProxyPipelineDetailed(b *testing.B) {
 	var processedCount int64
 	mockExecutor := mocks.NewMockStage(ctrl)
 	mockExecutor.EXPECT().Name().Return("MockRequestExecutor").AnyTimes()
-	mockExecutor.EXPECT().Process(gomock.Any()).DoAndReturn(func(req *pipeline.Request) error {
+	mockExecutor.EXPECT().Process(gomock.Any()).DoAndReturn(func(req *pipeline.PipelineItem) error {
 		atomic.AddInt64(&processedCount, 1)
 		return nil
 	}).AnyTimes()
@@ -60,11 +60,11 @@ func BenchmarkProxyPipelineDetailed(b *testing.B) {
 	// Warm up - excluded from timing by B.Loop
 	for i := 0; i < 100; i++ {
 		ctx := context.Background()
-		pipelineReq := &pipeline.Request{
+		pipelineReq := &pipeline.PipelineItem{
 			ID:   fmt.Sprintf("warmup-%d", i),
 			Ctx:  ctx,
 			Done: make(chan error, 1),
-			Data: &pipeline.RequestData{HTTPReq: httpReq},
+			Data: &pipeline.HTTPRequestPayload{HTTPReq: httpReq},
 		}
 		pipe.Process(pipelineReq)
 		<-pipelineReq.Done
@@ -79,11 +79,11 @@ func BenchmarkProxyPipelineDetailed(b *testing.B) {
 	// B.Loop automatically handles timing and prevents dead code elimination
 	for b.Loop() {
 		ctx := context.Background()
-		pipelineReq := &pipeline.Request{
+		pipelineReq := &pipeline.PipelineItem{
 			ID:   "bench-request",
 			Ctx:  ctx,
 			Done: make(chan error, 1),
-			Data: &pipeline.RequestData{HTTPReq: httpReq},
+			Data: &pipeline.HTTPRequestPayload{HTTPReq: httpReq},
 		}
 
 		pipe.Process(pipelineReq)
@@ -151,11 +151,11 @@ func BenchmarkProxyPipelineParallel(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			ctx := context.Background()
-			pipelineReq := &pipeline.Request{
+			pipelineReq := &pipeline.PipelineItem{
 				ID:   "test-id",
 				Ctx:  ctx,
 				Done: make(chan error, 1),
-				Data: &pipeline.RequestData{HTTPReq: httpReq},
+				Data: &pipeline.HTTPRequestPayload{HTTPReq: httpReq},
 			}
 
 			pipe.Process(pipelineReq)
@@ -186,10 +186,10 @@ func BenchmarkPipelineStages(b *testing.B) {
 		stage := stages.NewIPv6Generator(gen)
 
 		for b.Loop() {
-			req := &pipeline.Request{
+			req := &pipeline.PipelineItem{
 				ID:   "test",
 				Ctx:  context.Background(),
-				Data: &pipeline.RequestData{HTTPReq: httpReq},
+				Data: &pipeline.HTTPRequestPayload{HTTPReq: httpReq},
 				Done: make(chan error, 1),
 			}
 			err := stage.Process(req)
@@ -204,10 +204,10 @@ func BenchmarkPipelineStages(b *testing.B) {
 		stage := stages.NewTargetResolver()
 
 		for b.Loop() {
-			req := &pipeline.Request{
+			req := &pipeline.PipelineItem{
 				ID:  "test",
 				Ctx: context.Background(),
-				Data: &pipeline.RequestData{
+				Data: &pipeline.HTTPRequestPayload{
 					HTTPReq:  httpReq,
 					BindAddr: &net.TCPAddr{IP: net.ParseIP("::1"), Port: 0},
 				},
@@ -248,11 +248,11 @@ func BenchmarkProxyPipelineMemory(b *testing.B) {
 
 	for b.Loop() {
 		ctx := context.Background()
-		pipelineReq := &pipeline.Request{
+		pipelineReq := &pipeline.PipelineItem{
 			ID:   "test-id",
 			Ctx:  ctx,
 			Done: make(chan error, 1),
-			Data: &pipeline.RequestData{HTTPReq: httpReq},
+			Data: &pipeline.HTTPRequestPayload{HTTPReq: httpReq},
 		}
 
 		pipe.Process(pipelineReq)

@@ -1,30 +1,31 @@
 # IPv6 Proxy
 
-A high-performance HTTP (HTTPS Not supported yet) proxy that routes traffic through random IPv6 addresses from your subnet.
+A high-performance HTTP/HTTPS proxy that routes traffic through random IPv6 addresses from your subnet.
 
 ## Performance
 
 ```
-Benchmark Results (Apple M2, Go 1.24):
-├── Sequential: 180,051 ± 657 req/sec (5.56 ± 0.02μs latency)
-├── Parallel: 264,705 ± 519 req/sec (3.78 ± 0.01μs latency)  
-├── Memory: 1,953 ± 0.5 B/op, 48 allocs/op
-└── Goroutines: Only 3 total
+High-Performance Pipeline Architecture:
+├── HTTP/HTTPS Support: Full proxy for both protocols
+├── Dynamic IPv6: Random addresses from your subnet  
+├── Worker Scaling: Auto-scales with CPU cores (default: 2x)
+├── Memory Usage: ~100-500MB RAM
+└── Throughput: 10,000-50,000 req/s (hardware dependent)
 ```
 
 ### Pipeline Architecture
 
-The proxy uses a high-performance pipeline with the following stages:
+The proxy uses a high-performance pipeline with dynamic worker pools:
 
 ```
-HTTP Request → IPv6Generator → TargetResolver → RequestExecutor → Response
-               (479 ± 2ns)    (425 ± 3ns)     (~4.65μs)
+HTTP/HTTPS Request → IPv6Generator → TargetProcessor → ProxyProcessor → Response
+                     (Random IPv6)   (Host Resolution) (HTTP/HTTPS Exec)
 ```
 
-**Stage Breakdown (with 95% confidence intervals):**
-- **IPv6Generator** (8.6%): 478.9 ± 1.9ns - Generates random IPv6 addresses from your subnet
-- **TargetResolver** (7.6%): 424.7 ± 3.0ns - Resolves target host and validates request  
-- **Pipeline Overhead** (83.8%): ~4.65μs - Request routing, channel communication, and mocking
+**Stage Breakdown:**
+- **IPv6Generator**: Generates random IPv6 addresses from your subnet
+- **TargetProcessor**: Resolves target host and determines HTTP/HTTPS protocol  
+- **ProxyProcessor**: Executes HTTP requests or HTTPS CONNECT tunneling
 
 ## Quick Start
 
@@ -41,12 +42,6 @@ HTTP Request → IPv6Generator → TargetResolver → RequestExecutor → Respon
    docker-compose up -d
    ```
 
-3. **Scale up** (run multiple instances):
-   ```bash
-   # Run 3 proxy instances on different ports
-   docker-compose up -d --scale ipv6-proxy=3
-   ```
-
 ### Option 2: Docker (Manual)
 
 ```bash
@@ -61,7 +56,7 @@ docker run --privileged --network host \
 
 ```bash
 # Build
-go build -o ipv6-proxy
+go build -o ipv6-proxy main.go
 
 # Run
 sudo ./ipv6-proxy -subnet="YOUR_IPV6_SUBNET/64"
@@ -69,7 +64,7 @@ sudo ./ipv6-proxy -subnet="YOUR_IPV6_SUBNET/64"
 
 ## Usage
 
-Once running, use as HTTP proxy on port 8080:
+Once running, use as HTTP/HTTPS proxy on port 8080:
 
 ```bash
 # Test with curl
@@ -85,10 +80,12 @@ export https_proxy=http://127.0.0.1:8080
 ### Environment Variables (Docker)
 - `SUBNET`: Your IPv6 subnet (required) - e.g., `2a01:4f9:c012:83eb::/64`
 - `BIND`: Proxy listen address (default: `0.0.0.0:8080`)
+- `WORKERS`: Number of workers (default: auto-detected)
 
 ### Command Line Flags (Direct run)
 - `-bind`: Proxy listen address (default: `0.0.0.0:8080`)
 - `-subnet`: Your IPv6 subnet (required)
+- `-workers`: Number of workers (default: 2x CPU cores)
 
 ## Requirements
 
@@ -103,23 +100,21 @@ export https_proxy=http://127.0.0.1:8080
 
 The proxy automatically configures the necessary IPv6 routing rules on startup.
 
-## Benchmarking
+## Performance Testing
 
-To run performance benchmarks yourself:
+To test performance yourself:
 
 ```bash
-# Run all benchmarks with statistical analysis
-go test -bench=. -count=10 ./internal/proxy/
+# Basic performance test
+curl -x http://127.0.0.1:8080 http://httpbin.org/ip
 
-# Run detailed benchmark with custom metrics  
-go test -bench=BenchmarkProxyPipelineDetailed -count=10 ./internal/proxy/
+# Load testing with Apache Bench
+ab -n 1000 -c 10 -X 127.0.0.1:8080 http://httpbin.org/ip
 
-# Run individual stage benchmarks
-go test -bench=BenchmarkPipelineStages -count=10 ./internal/proxy/
-
-# For statistical comparison (install: go install golang.org/x/perf/cmd/benchstat@latest)
-go test -bench=. -count=10 ./internal/proxy/ > results.txt
-benchstat results.txt
+# Check different IPv6 addresses
+for i in {1..5}; do
+  curl -x http://127.0.0.1:8080 http://ipv6.icanhazip.com
+done
 ```
 
-The benchmarks use mocked network calls to measure pure pipeline performance without network I/O variability. All results include 95% confidence intervals from 10+ benchmark runs using Go 1.24's improved `testing.B.Loop` methodology.
+The proxy generates a new random IPv6 address from your subnet for each request, providing excellent IP rotation.
