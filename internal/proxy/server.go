@@ -21,9 +21,8 @@ func NewServer(cfg *config.Config) *Server {
 	// Create IPv6 generator
 	gen := ipv6.NewGenerator(cfg.IPv6Net, cfg.IPv6Base)
 
-	// Create pipeline with interface-based stages
+	// Create a pipeline with single worker for optimal performance
 	pipe := pipeline.New(
-		cfg.Workers,
 		stages.NewLogger(),           // Log all requests
 		stages.NewIPv6Generator(gen), // Generate random IPv6
 		stages.NewTargetResolver(),   // Resolve target address

@@ -25,42 +25,41 @@ type Request struct {
 }
 
 // Stage is the interface that all pipeline stages must implement
+//
+//go:generate mockgen -destination=mocks/mock_stage.go -package=mocks go-proxy6/internal/pipeline Stage
 type Stage interface {
 	Process(req *Request) error
 	Name() string
 }
 
-// Pipeline processes requests through a series of stages
+// Pipeline processes requests through a series of stages with a single worker
 type Pipeline struct {
-	stages  []Stage
-	input   chan *Request
-	workers int
-	ctx     context.Context
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
+	stages []Stage
+	input  chan *Request
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
-// New creates a new pipeline with the given stages
-func New(workers int, stages ...Stage) *Pipeline {
+// New creates a new pipeline with the given stages (single worker for optimal performance)
+func New(stages ...Stage) *Pipeline {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Pipeline{
-		stages:  stages,
-		input:   make(chan *Request, workers),
-		workers: workers,
-		ctx:     ctx,
-		cancel:  cancel,
+		stages: stages,
+		input:  make(chan *Request, 10),
+		ctx:    ctx,
+		cancel: cancel,
 	}
 }
 
-// Start begins processing requests through the pipeline
+// Start begins processing requests through the pipeline with a single worker
 func (p *Pipeline) Start() {
-	slog.Debug("Starting pipeline", slog.Int("workers", p.workers))
+	slog.Debug("Starting pipeline with single worker")
 
-	for i := 0; i < p.workers; i++ {
-		p.wg.Add(1)
-		go p.worker(i)
-	}
-	slog.Debug("Pipeline started", slog.Int("active_workers", p.workers))
+	p.wg.Add(1)
+	go p.worker()
+
+	slog.Debug("Pipeline started with single worker")
 }
 
 // Process sends a request through the pipeline
@@ -83,14 +82,14 @@ func (p *Pipeline) Stop() {
 	slog.Debug("Pipeline stopped")
 }
 
-// worker processes requests through all stages
-func (p *Pipeline) worker(workerID int) {
+// worker processes requests through all stages (single worker implementation)
+func (p *Pipeline) worker() {
 	defer func() {
 		p.wg.Done()
-		slog.Debug("Worker stopped", slog.Int("worker_id", workerID))
+		slog.Debug("Worker stopped")
 	}()
 
-	slog.Debug("Worker started", slog.Int("worker_id", workerID))
+	slog.Debug("Worker started")
 
 	for {
 		select {
@@ -101,7 +100,7 @@ func (p *Pipeline) worker(workerID int) {
 				return
 			}
 
-			slog.Debug("Processing request", slog.String("request_id", req.ID), slog.Int("worker_id", workerID))
+			slog.Debug("Processing request", slog.String("request_id", req.ID))
 
 			var err error
 			for _, stage := range p.stages {

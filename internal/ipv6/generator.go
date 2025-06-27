@@ -8,16 +8,14 @@ import (
 )
 
 type Generator struct {
-	network    *net.IPNet
-	base       net.IP
-	maxRetries int
+	network *net.IPNet
+	base    net.IP
 }
 
 func NewGenerator(network *net.IPNet, base net.IP) *Generator {
 	return &Generator{
-		network:    network,
-		base:       base,
-		maxRetries: 10,
+		network: network,
+		base:    base,
 	}
 }
 
@@ -31,26 +29,49 @@ func (g *Generator) RandomAddr() (*net.TCPAddr, error) {
 	return &net.TCPAddr{IP: ip, Port: 0}, nil
 }
 
+// randomIP generates a randomized IPv6 address within the generator's configured subnet.
 func (g *Generator) randomIP() (net.IP, error) {
-	ones, bits := g.network.Mask.Size()
-	if bits != 128 {
-		return nil, fmt.Errorf("invalid IPv6 mask")
-	}
-
-	hostBits := bits - ones
-	hostBytes := (hostBits + 7) / 8
-
-	randomBytes := make([]byte, hostBytes)
-	if _, err := rand.Read(randomBytes); err != nil {
+	if err := g.validateMask(); err != nil {
 		return nil, err
 	}
 
-	ip := make(net.IP, len(g.base))
-	copy(ip, g.base)
+	randomBytes, err := generateRandomBytes(g.hostBytes())
+	if err != nil {
+		return nil, err
+	}
 
-	byteOffset := ones / 8
-	bitOffset := ones % 8
+	return applyRandomHost(g.base, g.network.Mask.Size, randomBytes), nil
+}
 
+// validateMask checks if the network mask is valid for IPv6.
+func (g *Generator) validateMask() error {
+	_, bits := g.network.Mask.Size()
+	if bits != 128 {
+		return fmt.Errorf("invalid IPv6 mask")
+	}
+	return nil
+}
+
+// hostBytes calculates the number of bytes required for the host portion of the IP address.
+func (g *Generator) hostBytes() int {
+	ones, bits := g.network.Mask.Size()
+	return (bits - ones + 7) / 8
+}
+
+// applyRandomHost creates a new IP by injecting random host bits into the base IP.
+func applyRandomHost(base net.IP, maskSize func() (int, int), randomBytes []byte) net.IP {
+	ones, _ := maskSize()
+	ip := make(net.IP, len(base))
+	copy(ip, base)
+
+	byteOffset, bitOffset := ones/8, ones%8
+	applyBytes(ip, randomBytes, byteOffset, bitOffset)
+
+	return ip
+}
+
+// applyBytes modifies the base IP by applying random bytes at a specific offset.
+func applyBytes(ip net.IP, randomBytes []byte, byteOffset, bitOffset int) {
 	for i, b := range randomBytes {
 		if byteOffset+i >= len(ip) {
 			break
@@ -62,22 +83,11 @@ func (g *Generator) randomIP() (net.IP, error) {
 			ip[byteOffset+i] = (ip[byteOffset+i] & ^mask) | (b & mask)
 		}
 	}
-
-	return ip, nil
 }
 
-func (g *Generator) isValidIPv6(ip net.IP) bool {
-	// Try to bind to the address to check if it's actually usable
-	addr := &net.TCPAddr{IP: ip, Port: 0}
-	listener, err := net.ListenTCP("tcp6", addr)
-	if err != nil {
-		slog.Warn("TCP bind test failed",
-			"ip", ip.String(),
-			"error", err.Error(),
-			"error_type", fmt.Sprintf("%T", err))
-		return false
-	}
-	listener.Close()
-	slog.Debug("TCP bind test succeeded", "ip", ip.String())
-	return true
+// generateRandomBytes creates a slice of random bytes.
+func generateRandomBytes(size int) ([]byte, error) {
+	randomBytes := make([]byte, size)
+	_, err := rand.Read(randomBytes)
+	return randomBytes, err
 }
