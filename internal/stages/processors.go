@@ -3,6 +3,7 @@ package stages
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"go-proxy6/internal/ipv6"
 	"go-proxy6/internal/pipeline"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -116,7 +118,7 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	bindAddr := payload.BindAddr
 	resp := payload.Response
 
-	// FIXED: Connect to target with IPv6 binding
+	// Enhanced connection to target with IPv6 binding
 	destConn, err := p.dialWithBind(target, bindAddr)
 	if err != nil {
 		if !payload.ResponseSent() {
@@ -151,7 +153,7 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	}
 	defer clientConn.Close()
 
-	// FIXED: Send proper 200 Connection established response
+	// Send proper 200 Connection established response
 	connectResponse := "HTTP/1.1 200 Connection established\r\n\r\n"
 	_, err = clientConn.Write([]byte(connectResponse))
 	if err != nil {
@@ -159,28 +161,35 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	}
 	payload.MarkResponseSent()
 
-	// FIXED: Bidirectional copy with proper error handling
+	// Set deadlines to prevent hangs
+	clientConn.SetDeadline(time.Now().Add(5 * time.Minute))
+	destConn.SetDeadline(time.Now().Add(5 * time.Minute))
+
+	// Bidirectional copy with proper error handling and larger buffers
 	errChan := make(chan error, 2)
 
-	// Copy from client to destination
+	// Copy from client to destination with larger buffer
 	go func() {
-		_, err := io.Copy(destConn, clientConn)
+		buf := make([]byte, 65536)
+		_, err := io.CopyBuffer(destConn, clientConn, buf)
 		errChan <- err
 	}()
 
-	// Copy from destination to client
+	// Copy from destination to client with larger buffer
 	go func() {
-		_, err := io.Copy(clientConn, destConn)
+		buf := make([]byte, 65536)
+		_, err := io.CopyBuffer(clientConn, destConn, buf)
 		errChan <- err
 	}()
 
-	// Wait for first error or context cancellation
+	// Wait for first error, context cancellation, or deadline
 	select {
 	case err := <-errChan:
-		// One direction finished/failed, close connections to stop the other
-		clientConn.Close()
-		destConn.Close()
-		return err
+		// Ignore EOF errors which are normal when connections close
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		return nil
 	case <-payload.Ctx.Done():
 		return payload.Ctx.Err()
 	}
@@ -198,18 +207,36 @@ func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 	// Create transport with IPv6-only custom dialer
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			// SECURITY: Force IPv6-only to prevent IP leakage
+			// Force IPv6-only to prevent IP leakage
 			return p.dialWithBind(addr, bindAddr)
 		},
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: false,
+			MinVersion:         tls.VersionTLS12,
+			MaxVersion:         tls.VersionTLS13,
+			// Add full suite of cipher suites for maximum compatibility
+			CipherSuites: []uint16{
+				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+				// Add additional cipher suites for compatibility
+				tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+			},
+			// Add client-initiated renegotiation for problematic servers
+			Renegotiation: tls.RenegotiateOnceAsClient,
 		},
+		// Increase all timeouts for better reliability
 		DisableKeepAlives:     false,
 		DisableCompression:    false,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   10,
 		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
+		TLSHandshakeTimeout:   20 * time.Second, // Increased from 10s
+		ResponseHeaderTimeout: 30 * time.Second, // Add timeout for headers
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
 	}
@@ -306,43 +333,84 @@ func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 }
 
 func (p *ProxyProcessor) dialWithBind(addr string, bindAddr *net.TCPAddr) (net.Conn, error) {
-	// SECURITY: IPv6-only to prevent IP leakage
+	// IPv6-only to prevent IP leakage
 	if bindAddr.IP.To4() != nil {
 		return nil, fmt.Errorf("IPv4 bind address not allowed - IPv6 only")
 	}
 
-	// FIXED: Improved dialer with better error handling
-	dialer := &net.Dialer{
-		LocalAddr: &net.TCPAddr{
-			IP: bindAddr.IP,
-		},
-		Timeout:   15 * time.Second, // Increased timeout for stability
-		KeepAlive: 30 * time.Second,
-	}
-
-	// Force IPv6-only connection - try tcp6 first, then tcp
-	conn, err := dialer.Dial("tcp6", addr)
+	// Parse target address
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		// Fallback to tcp (but still with IPv6 bind)
-		conn, err = dialer.Dial("tcp", addr)
-		if err != nil {
-			// Enhanced logging for debugging
-			fmt.Printf("IPv6 dial failed - Local: %s, Target: %s, Error: %v\n",
-				bindAddr.IP.String(), addr, err)
-			return nil, fmt.Errorf("IPv6 connection failed: %v", err)
+		return nil, fmt.Errorf("invalid target address %s: %v", addr, err)
+	}
+
+	// Look up host (IPv6 only)
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve %s: %v", host, err)
+	}
+
+	// Find an IPv6 address
+	var targetIP net.IP
+	for _, ip := range ips {
+		if ip.To4() == nil {
+			targetIP = ip
+			break
 		}
 	}
 
-	// SECURITY: Double-check that connection is actually IPv6
+	if targetIP == nil {
+		return nil, fmt.Errorf("no IPv6 address found for %s", host)
+	}
+
+	// Create target address
+	targetAddr := &net.TCPAddr{
+		IP:   targetIP,
+		Port: parseInt(port),
+	}
+
+	// Special handling for known problematic sites
+	var connectTimeout time.Duration = 15 * time.Second
+	if strings.Contains(host, "ipv6-test.com") ||
+		strings.Contains(host, "test-ipv6.com") {
+		// These sites often need more time or special handling
+		connectTimeout = 25 * time.Second
+	}
+
+	// Enhanced dialer with extended timeouts
+	dialer := &net.Dialer{
+		LocalAddr: bindAddr,
+		Timeout:   connectTimeout,
+		KeepAlive: 30 * time.Second,
+		DualStack: false, // Force IPv6 only
+	}
+
+	// Connect directly to the IPv6 address
+	conn, err := dialer.Dial("tcp6", targetAddr.String())
+	if err != nil {
+		// Provide detailed error info for debugging
+		return nil, fmt.Errorf("IPv6 connection to %s (%s) failed: %v",
+			host, targetIP, err)
+	}
+
+	// Configure TCP options for better performance
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		remoteAddr := tcpConn.RemoteAddr().(*net.TCPAddr)
-		if remoteAddr.IP.To4() != nil {
-			conn.Close()
-			return nil, fmt.Errorf("security violation: connected to IPv4 address %s", remoteAddr.IP)
-		}
+		tcpConn.SetNoDelay(true)
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+
+		// Add larger buffers for better performance
+		tcpConn.SetReadBuffer(65536)
+		tcpConn.SetWriteBuffer(65536)
 	}
 
 	return conn, nil
+}
+
+// Helper function to parse port
+func parseInt(s string) int {
+	n, _ := strconv.Atoi(s)
+	return n
 }
 
 // isHopByHopHeader reports whether hdr is an RFC 2616 hop-by-hop header
