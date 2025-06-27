@@ -24,7 +24,12 @@ func (g *Generator) RandomAddr() (*net.TCPAddr, error) {
 		return nil, err
 	}
 
-	return &net.TCPAddr{IP: ip, Port: 0}, nil
+	// SECURITY: Ensure we only return IPv6 addresses
+	if ip.To4() != nil {
+		return nil, fmt.Errorf("security error: generated IPv4 address instead of IPv6")
+	}
+
+	return &net.TCPAddr{IP: ip}, nil
 }
 
 // randomIP generates a randomized IPv6 address within the generator's configured subnet.

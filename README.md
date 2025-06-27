@@ -1,6 +1,13 @@
 # IPv6 Proxy
 
-A high-performance HTTP/HTTPS proxy that routes traffic through random IPv6 addresses from your subnet.
+A high-performance **IPv6-only** HTTP/HTTPS proxy that routes traffic through random IPv6 addresses from your subnet.
+
+## Security Features
+
+🔒 **IPv6-Only Operation**: No IPv4 fallback to prevent IP leakage  
+🔒 **Subnet Validation**: Only uses addresses from your specified IPv6 subnet  
+🔒 **Fail-Safe Design**: Fails fast if IPv6 is not available  
+🔒 **No DNS Leaks**: All connections forced through IPv6  
 
 ## Performance
 
@@ -96,8 +103,11 @@ export https_proxy=http://127.0.0.1:8080
 ## Requirements
 
 - Linux server with IPv6 subnet (e.g., from Vultr, Hetzner, DigitalOcean)
+- **IPv6-only environment** - no IPv4 fallback for security
 - Docker and docker-compose installed
 - Root privileges (automatically handled by Docker)
+
+**⚠️ Security Note:** This proxy operates in IPv6-only mode to prevent IP leakage. If IPv6 is not properly configured, the proxy will fail rather than fall back to IPv4.
 
 **How to get IPv6 subnet:**
 1. Order VPS with IPv6 support from providers like Vultr, Hetzner

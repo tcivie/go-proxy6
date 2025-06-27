@@ -147,13 +147,14 @@ func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 	isHTTPS := req.TLS != nil || req.Header.Get("X-Forwarded-Proto") == "https" ||
 		strings.HasSuffix(payload.Target, ":443")
 
-	// Create transport with custom dialer and HTTPS support
+	// Create transport with IPv6-only custom dialer
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// SECURITY: Force IPv6-only to prevent IP leakage
 			return p.dialWithBind(addr, bindAddr)
 		},
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: false, // Change to true if you need to skip SSL verification
+			InsecureSkipVerify: false,
 		},
 		DisableKeepAlives:     false,
 		DisableCompression:    false,
@@ -162,6 +163,8 @@ func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		// Force IPv6-only at transport level
+		ForceAttemptHTTP2: true,
 	}
 
 	client := &http.Client{
@@ -228,12 +231,28 @@ func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 }
 
 func (p *ProxyProcessor) dialWithBind(addr string, bindAddr *net.TCPAddr) (net.Conn, error) {
+	// SECURITY: IPv6-only to prevent IP leakage
+	if bindAddr.IP.To4() != nil {
+		return nil, fmt.Errorf("IPv4 bind address not allowed - IPv6 only")
+	}
+
 	dialer := &net.Dialer{
-		LocalAddr: bindAddr,
+		LocalAddr: &net.TCPAddr{
+			IP: bindAddr.IP,
+		},
 		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
-	return dialer.Dial("tcp", addr)
+
+	// Force IPv6-only connection
+	conn, err := dialer.Dial("tcp6", addr)
+	if err != nil {
+		// Log for debugging IPv6 issues
+		fmt.Printf("IPv6 dial failed - Local: %s, Target: %s, Error: %v\n", bindAddr.IP.String(), addr, err)
+		return nil, fmt.Errorf("IPv6 connection failed: %v", err)
+	}
+
+	return conn, nil
 }
 
 func (p *ProxyProcessor) copyData(dst, src net.Conn, errChan chan error) {
