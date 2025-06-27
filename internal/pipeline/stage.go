@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"log"
 )
 
 type dynamicWorkerPool struct {
@@ -47,11 +48,39 @@ stop:
 			}
 
 			go func(payloadIn Payload, token struct{}) {
-				defer func() { p.tokenPool <- token }()
+				defer func() {
+					p.tokenPool <- token
+
+					// Recover from any panics in processors to prevent crashing
+					if r := recover(); r != nil {
+						log.Printf("Pipeline stage %d panic recovered: %v", params.StageIndex(), r)
+
+						// Try to handle the payload if it's an HTTP payload
+						if httpPayload, ok := payloadIn.(*HTTPPayload); ok {
+							if !httpPayload.ResponseSent() {
+								httpPayload.Response.WriteHeader(500)
+								httpPayload.Response.Write([]byte("Internal server error"))
+								httpPayload.MarkResponseSent()
+							}
+							httpPayload.Complete(fmt.Errorf("processor panic: %v", r))
+						}
+						payloadIn.MarkAsProcessed()
+					}
+				}()
+
 				payloadOut, err := p.proc.Process(ctx, payloadIn)
 				if err != nil {
-					wrappedErr := fmt.Errorf("pipeline stage %d: %w", params.StageIndex(), err)
-					maybeEmitError(wrappedErr, params.Error())
+					// Log the error but don't send it to error channel unless it's critical
+					log.Printf("Pipeline stage %d error (handled): %v", params.StageIndex(), err)
+
+					// For HTTP payloads, ensure proper completion
+					if httpPayload, ok := payloadIn.(*HTTPPayload); ok {
+						if !httpPayload.IsComplete() {
+							httpPayload.Complete(err)
+						}
+					}
+
+					payloadIn.MarkAsProcessed()
 					return
 				}
 
@@ -66,6 +95,8 @@ stop:
 				select {
 				case params.Output() <- payloadOut:
 				case <-ctx.Done():
+					// Context cancelled, mark as processed
+					payloadIn.MarkAsProcessed()
 				}
 			}(payloadIn, token)
 		}

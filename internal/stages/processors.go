@@ -28,7 +28,13 @@ func (p *IPv6Processor) Process(ctx context.Context, payload pipeline.Payload) (
 
 	addr, err := p.generator.RandomAddr()
 	if err != nil {
-		return nil, fmt.Errorf("IPv6 generation failed: %v", err)
+		// Send error response and complete the request
+		if !httpPayload.ResponseSent() {
+			http.Error(httpPayload.Response, "IPv6 address generation failed", http.StatusInternalServerError)
+			httpPayload.MarkResponseSent()
+		}
+		httpPayload.Complete(fmt.Errorf("IPv6 generation failed: %v", err))
+		return nil, nil // Don't propagate error, request is handled
 	}
 
 	httpPayload.BindAddr = addr
@@ -58,7 +64,13 @@ func (p *TargetProcessor) Process(ctx context.Context, payload pipeline.Payload)
 			host = req.URL.Host
 		}
 		if host == "" {
-			return nil, fmt.Errorf("missing host")
+			// Send error response and complete the request
+			if !httpPayload.ResponseSent() {
+				http.Error(httpPayload.Response, "Missing host", http.StatusBadRequest)
+				httpPayload.MarkResponseSent()
+			}
+			httpPayload.Complete(fmt.Errorf("missing host"))
+			return nil, nil // Don't propagate error, request is handled
 		}
 
 		// Determine port based on scheme or default
@@ -86,15 +98,16 @@ func NewProxyProcessor() *ProxyProcessor {
 func (p *ProxyProcessor) Process(ctx context.Context, payload pipeline.Payload) (pipeline.Payload, error) {
 	httpPayload := payload.(*pipeline.HTTPPayload)
 
+	var err error
 	if httpPayload.Request.Method == http.MethodConnect {
-		err := p.handleConnect(httpPayload)
-		httpPayload.Complete(err)
-		return nil, err // Don't pass CONNECT requests further
+		err = p.handleConnect(httpPayload)
+	} else {
+		err = p.handleHTTP(httpPayload)
 	}
 
-	err := p.handleHTTP(httpPayload)
+	// Always complete the request, regardless of error
 	httpPayload.Complete(err)
-	return nil, err // Don't pass HTTP requests further (they're complete)
+	return nil, nil // Never propagate errors that would kill the pipeline
 }
 
 func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
@@ -105,6 +118,10 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	// Connect to target with binding
 	destConn, err := p.dialWithBind(target, bindAddr)
 	if err != nil {
+		if !payload.ResponseSent() {
+			http.Error(resp, fmt.Sprintf("Failed to connect to %s", target), http.StatusBadGateway)
+			payload.MarkResponseSent()
+		}
 		return fmt.Errorf("failed to connect to %s: %v", target, err)
 	}
 	defer destConn.Close()
@@ -112,17 +129,26 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	// Hijack the client connection
 	hijacker, ok := resp.(http.Hijacker)
 	if !ok {
+		if !payload.ResponseSent() {
+			http.Error(resp, "Hijacking not supported", http.StatusInternalServerError)
+			payload.MarkResponseSent()
+		}
 		return fmt.Errorf("hijacking not supported")
 	}
 
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
+		if !payload.ResponseSent() {
+			http.Error(resp, "Failed to hijack connection", http.StatusInternalServerError)
+			payload.MarkResponseSent()
+		}
 		return fmt.Errorf("failed to hijack connection: %v", err)
 	}
 	defer clientConn.Close()
 
 	// Send connection established response
 	clientConn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+	payload.MarkResponseSent()
 
 	// Bidirectional copy
 	errChan := make(chan error, 2)
@@ -163,8 +189,7 @@ func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		// Force IPv6-only at transport level
-		ForceAttemptHTTP2: true,
+		ForceAttemptHTTP2:     true,
 	}
 
 	client := &http.Client{
@@ -196,6 +221,10 @@ func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 	// Create proxy request
 	proxyReq, err := http.NewRequestWithContext(payload.Ctx, req.Method, targetURL.String(), req.Body)
 	if err != nil {
+		if !payload.ResponseSent() {
+			http.Error(resp, "Failed to create proxy request", http.StatusInternalServerError)
+			payload.MarkResponseSent()
+		}
 		return fmt.Errorf("failed to create proxy request: %v", err)
 	}
 
@@ -211,6 +240,28 @@ func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 	// Execute request
 	proxyResp, err := client.Do(proxyReq)
 	if err != nil {
+		if !payload.ResponseSent() {
+			// Provide more specific error messages based on the type of error
+			var errorMsg string
+			var statusCode int
+
+			if strings.Contains(err.Error(), "no such host") {
+				errorMsg = "Host not found"
+				statusCode = http.StatusNotFound
+			} else if strings.Contains(err.Error(), "connection refused") {
+				errorMsg = "Connection refused"
+				statusCode = http.StatusBadGateway
+			} else if strings.Contains(err.Error(), "timeout") {
+				errorMsg = "Connection timeout"
+				statusCode = http.StatusGatewayTimeout
+			} else {
+				errorMsg = "Proxy request failed"
+				statusCode = http.StatusBadGateway
+			}
+
+			http.Error(resp, errorMsg, statusCode)
+			payload.MarkResponseSent()
+		}
 		return fmt.Errorf("proxy request failed: %v", err)
 	}
 	defer proxyResp.Body.Close()
@@ -226,6 +277,8 @@ func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 
 	// Copy status code and body
 	resp.WriteHeader(proxyResp.StatusCode)
+	payload.MarkResponseSent()
+
 	_, err = io.Copy(resp, proxyResp.Body)
 	return err
 }
@@ -247,8 +300,9 @@ func (p *ProxyProcessor) dialWithBind(addr string, bindAddr *net.TCPAddr) (net.C
 	// Force IPv6-only connection
 	conn, err := dialer.Dial("tcp6", addr)
 	if err != nil {
-		// Log for debugging IPv6 issues
-		fmt.Printf("IPv6 dial failed - Local: %s, Target: %s, Error: %v\n", bindAddr.IP.String(), addr, err)
+		// More detailed logging for debugging
+		fmt.Printf("IPv6 dial failed - Request: %s, Local: %s, Target: %s, Error: %v\n",
+			"", bindAddr.IP.String(), addr, err)
 		return nil, fmt.Errorf("IPv6 connection failed: %v", err)
 	}
 

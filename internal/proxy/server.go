@@ -19,7 +19,7 @@ type Server struct {
 	config     *config.Config
 	pipeline   *pipeline.Pipeline
 	requestCh  chan *pipeline.HTTPPayload
-	ctx        context.Context
+	ctx        context.Context // Server context - for shutdown only
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
 	maxWorkers int
@@ -60,7 +60,7 @@ func (s *Server) Start() error {
 		pipeline.DynamicWorkerPool(stages.NewProxyProcessor(), s.maxWorkers/2), // Fewer workers for actual requests
 	)
 
-	// Start request processor
+	// Start request processor with proper error handling
 	s.wg.Add(1)
 	go s.processRequests()
 
@@ -75,14 +75,14 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
-	// Create request context with timeout
-	ctx, cancel := context.WithTimeout(s.ctx, 60*time.Second)
+	// Create request-specific context with timeout (separate from server context)
+	requestCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Create payload
+	// Create payload with request-specific context
 	payload := pipeline.NewHTTPPayload(
 		generateID(),
-		ctx,
+		requestCtx,
 		r,
 		w,
 	)
@@ -94,11 +94,22 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		select {
 		case err := <-payload.Done():
 			if err != nil {
-				log.Printf("Request failed: %v", err)
-				// Error response already handled by processor
+				log.Printf("Request %s failed: %v", payload.ID, err)
+				// Error response should already be handled by processor
+				// If not handled, send a generic error
+				if !payload.ResponseSent() {
+					http.Error(w, "Proxy error", http.StatusBadGateway)
+				}
 			}
-		case <-ctx.Done():
-			http.Error(w, "Request timeout", http.StatusGatewayTimeout)
+		case <-requestCtx.Done():
+			if !payload.ResponseSent() {
+				http.Error(w, "Request timeout", http.StatusGatewayTimeout)
+			}
+		case <-s.ctx.Done():
+			// Server shutting down
+			if !payload.ResponseSent() {
+				http.Error(w, "Server shutting down", http.StatusServiceUnavailable)
+			}
 		}
 	default:
 		// Channel full, reject request
@@ -109,21 +120,36 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 func (s *Server) processRequests() {
 	defer s.wg.Done()
 
-	// Create simple source that reads from channel
-	source := &channelSource{ch: s.requestCh, ctx: s.ctx}
+	// Create source that reads from channel
+	source := &channelSource{ch: s.requestCh, serverCtx: s.ctx}
 
-	// Create simple sink (requests complete themselves)
-	sink := &noopSink{}
+	// Create sink that handles errors gracefully
+	sink := &errorHandlingSink{}
 
+	// Keep processing requests until server shutdown
 	for {
 		select {
 		case <-s.ctx.Done():
+			log.Println("Request processor shutting down...")
 			return
 		default:
-			err := s.pipeline.Process(s.ctx, source, sink)
+			// Process a batch of requests
+			// Use a fresh context for each batch so errors don't kill the pipeline
+			batchCtx, batchCancel := context.WithCancel(s.ctx)
+
+			err := s.pipeline.Process(batchCtx, source, sink)
+			batchCancel()
+
 			if err != nil && s.ctx.Err() == nil {
-				log.Printf("Pipeline error: %v", err)
-				time.Sleep(100 * time.Millisecond) // Brief pause on error
+				// Log the error but don't stop processing
+				log.Printf("Pipeline batch completed with errors (continuing): %v", err)
+			}
+
+			// Brief pause to prevent tight loop on persistent errors
+			select {
+			case <-time.After(10 * time.Millisecond):
+			case <-s.ctx.Done():
+				return
 			}
 		}
 	}
@@ -139,10 +165,10 @@ func (s *Server) Stop() {
 
 // channelSource implements pipeline.Source for channel-based input
 type channelSource struct {
-	ch      chan *pipeline.HTTPPayload
-	ctx     context.Context
-	current *pipeline.HTTPPayload
-	err     error
+	ch        chan *pipeline.HTTPPayload
+	serverCtx context.Context
+	current   *pipeline.HTTPPayload
+	err       error
 }
 
 func (s *channelSource) Next(ctx context.Context) bool {
@@ -156,8 +182,8 @@ func (s *channelSource) Next(ctx context.Context) bool {
 	case <-ctx.Done():
 		s.err = ctx.Err()
 		return false
-	case <-s.ctx.Done():
-		s.err = s.ctx.Err()
+	case <-s.serverCtx.Done():
+		s.err = s.serverCtx.Err()
 		return false
 	}
 }
@@ -170,12 +196,21 @@ func (s *channelSource) Error() error {
 	return s.err
 }
 
-// noopSink implements pipeline.Sink but does nothing (requests complete themselves)
-type noopSink struct{}
+// errorHandlingSink implements pipeline.Sink with proper error handling
+type errorHandlingSink struct{}
 
-func (s *noopSink) Consume(ctx context.Context, payload pipeline.Payload) error {
-	// Requests handle their own completion
-	return nil
+func (s *errorHandlingSink) Consume(ctx context.Context, payload pipeline.Payload) error {
+	// Requests handle their own completion, but we should never return errors
+	// that would kill the pipeline. All request errors should be handled
+	// at the request level.
+	httpPayload := payload.(*pipeline.HTTPPayload)
+
+	// Ensure the request is marked as complete even if processors failed
+	if !httpPayload.IsComplete() {
+		httpPayload.Complete(nil)
+	}
+
+	return nil // Never return errors that would kill the pipeline
 }
 
 func generateID() string {
