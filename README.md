@@ -28,15 +28,6 @@ HTTP Request → IPv6Generator → TargetResolver → RequestExecutor → Respon
 - **TargetResolver** (11.6%): Resolves target host and validates request
 - **RequestExecutor** (75.4%): Handles the actual HTTP proxy request with IPv6 binding
 
-**Key Optimizations:**
-- ✅ **Single worker design** - eliminates context switching overhead
-- ✅ **Buffered channels** - reduces blocking with 10-slot request buffer  
-- ✅ **Minimal allocations** - only 45 allocations per request
-- ✅ **Input validation** - ensures base IP belongs to specified network
-- ✅ **Concurrent I/O** - each proxy request spawns dedicated goroutines for data transfer
-
-This architecture ensures **sub-millisecond pipeline overhead** while your actual network requests happen in parallel.
-
 ## Quick Start
 
 ### Option 1: Docker Compose (Recommended)
