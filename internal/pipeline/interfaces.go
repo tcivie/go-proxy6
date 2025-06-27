@@ -15,6 +15,8 @@ type Payload interface {
 
 // Processor is implemented by types that can process Payloads as part of a
 // pipeline stage.
+//
+//go:generate mockgen -destination=mocks/mock_processor.go -package=mocks go-proxy6/internal/pipeline Processor
 type Processor interface {
 	// Process operates on the input payload and returns back a new payload
 	// to be forwarded to the next pipeline stage. Processors may also opt
