@@ -6,6 +6,7 @@ services:
     network_mode: host
     environment:
       - SUBNET=2a01:4f9:c012:83eb::/64 # Change this to your actual IPv6 subnet
+      - BIND=0.0.0.0:8080
     restart: unless-stopped
     cap_add:
       - NET_ADMIN

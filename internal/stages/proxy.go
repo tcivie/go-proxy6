@@ -4,92 +4,15 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"go-proxy6/internal/ipv6"
 	"go-proxy6/internal/pipeline"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 )
-
-// IPv6Processor generates random IPv6 addresses
-type IPv6Processor struct {
-	generator *ipv6.Generator
-}
-
-func NewIPv6Processor(gen *ipv6.Generator) *IPv6Processor {
-	return &IPv6Processor{generator: gen}
-}
-
-func (p *IPv6Processor) Process(ctx context.Context, payload pipeline.Payload) (pipeline.Payload, error) {
-	httpPayload := payload.(*pipeline.HTTPPayload)
-
-	addr, err := p.generator.RandomAddr()
-	if err != nil {
-		if !httpPayload.ResponseSent() {
-			http.Error(httpPayload.Response, "IPv6 address generation failed", http.StatusInternalServerError)
-			httpPayload.MarkResponseSent()
-		}
-		httpPayload.Complete(fmt.Errorf("IPv6 generation failed: %v", err))
-		return nil, nil
-	}
-
-	httpPayload.BindAddr = addr
-	log.Printf("[%s] ⇄ IPv6 %s", httpPayload.ID, addr.IP.String())
-	return httpPayload, nil
-}
-
-// TargetProcessor resolves target addresses and determines HTTPS
-type TargetProcessor struct{}
-
-func NewTargetProcessor() *TargetProcessor {
-	return &TargetProcessor{}
-}
-
-func (p *TargetProcessor) Process(ctx context.Context, payload pipeline.Payload) (pipeline.Payload, error) {
-	httpPayload := payload.(*pipeline.HTTPPayload)
-	req := httpPayload.Request
-
-	var target string
-	if req.Method == http.MethodConnect {
-		// CONNECT method for HTTPS tunneling
-		target = req.Host
-		if !strings.Contains(target, ":") {
-			target += ":443" // HTTPS default
-		}
-	} else {
-		host := req.Host
-		if host == "" {
-			host = req.URL.Host
-		}
-		if host == "" {
-			if !httpPayload.ResponseSent() {
-				http.Error(httpPayload.Response, "Missing host", http.StatusBadRequest)
-				httpPayload.MarkResponseSent()
-			}
-			httpPayload.Complete(fmt.Errorf("missing host"))
-			return nil, nil
-		}
-
-		// Determine port based on scheme or default
-		if !strings.Contains(host, ":") {
-			if req.TLS != nil || req.Header.Get("X-Forwarded-Proto") == "https" {
-				host += ":443"
-			} else {
-				host += ":80"
-			}
-		}
-		target = host
-	}
-
-	httpPayload.Target = target
-	log.Printf("[%s] ⇉ Target %s", httpPayload.ID, target)
-	return httpPayload, nil
-}
 
 // ProxyProcessor executes HTTP/HTTPS proxy requests
 type ProxyProcessor struct{}
@@ -119,7 +42,11 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 	bindAddr := payload.BindAddr
 	resp := payload.Response
 
-	log.Printf("[%s] ⇆ CONNECT %s via %s", payload.ID, target, bindAddr.IP.String())
+	slog.Info("CONNECT",
+		"id", payload.ID,
+		"target", target,
+		"via", bindAddr.IP.String(),
+	)
 
 	dialer := &net.Dialer{
 		LocalAddr: bindAddr,
@@ -210,7 +137,12 @@ func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 		RawQuery: req.URL.RawQuery,
 		Fragment: req.URL.Fragment,
 	}
-	log.Printf("[%s] ⇆ HTTP %s %s via %s", payload.ID, req.Method, targetURL.String(), bindAddr.IP.String())
+	slog.Info("HTTP request",
+		"id", payload.ID,
+		"method", req.Method,
+		"target_url", targetURL.String(),
+		"via", bindAddr.IP.String(),
+	)
 
 	// Create proxy request
 	proxyReq, err := http.NewRequestWithContext(payload.Ctx, req.Method, targetURL.String(), req.Body)
@@ -256,71 +188,11 @@ func (p *ProxyProcessor) handleHTTP(payload *pipeline.HTTPPayload) error {
 	payload.MarkResponseSent()
 
 	_, err = io.Copy(resp, proxyResp.Body)
-	log.Printf("[%s] ⇇ HTTP %d", payload.ID, proxyResp.StatusCode)
+	slog.Info("HTTP response",
+		"id", payload.ID,
+		"status_code", proxyResp.StatusCode,
+	)
 	return err
-}
-
-// Simple IPv6 dialer that enforces IPv6-only connections
-func (p *ProxyProcessor) dialWithIPv6(addr string, localIP net.IP) (net.Conn, error) {
-	// Parse target address
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return nil, fmt.Errorf("invalid target address %s: %v", addr, err)
-	}
-
-	// Resolve all IPs (IPv4 and IPv6)
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve %s: %v", host, err)
-	}
-
-	// Find IPv6 addresses
-	var ipv6s []net.IP
-	for _, ip := range ips {
-		if ip.To4() == nil {
-			ipv6s = append(ipv6s, ip)
-		}
-	}
-
-	if len(ipv6s) == 0 {
-		return nil, fmt.Errorf("no IPv6 addresses found for %s", host)
-	}
-
-	// Parse port
-	portNum, err := strconv.Atoi(port)
-	if err != nil {
-		return nil, fmt.Errorf("invalid port %s: %v", port, err)
-	}
-
-	// Create bind address
-	bindAddr := &net.TCPAddr{
-		IP: localIP,
-	}
-
-	// Try each IPv6 address
-	var lastErr error
-	for _, ip := range ipv6s {
-		targetAddr := &net.TCPAddr{
-			IP:   ip,
-			Port: portNum,
-		}
-
-		dialer := &net.Dialer{
-			LocalAddr: bindAddr,
-			Timeout:   10 * time.Second,
-		}
-
-		conn, err := dialer.Dial("tcp6", targetAddr.String())
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		log.Printf("Connected to %s (%s) via IPv6", host, ip.String())
-		return conn, nil
-	}
-
-	return nil, fmt.Errorf("failed to connect to any IPv6 address for %s: %v", host, lastErr)
 }
 
 // isHopByHopHeader checks if a header should not be forwarded

@@ -9,6 +9,7 @@ import (
 	"go-proxy6/internal/pipeline"
 	"go-proxy6/internal/stages"
 	"log"
+	"log/slog"
 	"net/http"
 	"runtime"
 	"sync"
@@ -72,9 +73,11 @@ func (s *Server) Start() error {
 		}),
 	}
 
-	log.Printf("Starting high-performance IPv6 proxy on %s", s.config.BindAddr)
-	log.Printf("IPv6 subnet: %s", s.config.IPv6Subnet)
-	log.Printf("Max workers: %d", s.maxWorkers)
+	slog.Info("Starting high-performance IPv6 proxy",
+		"bind_addr", s.config.BindAddr,
+		"ipv6_subnet", s.config.IPv6Subnet,
+		"max_workers", s.maxWorkers,
+	)
 
 	return server.ListenAndServe()
 }

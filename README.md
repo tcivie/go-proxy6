@@ -2,52 +2,37 @@
 
 A high-performance **IPv6-only** HTTP/HTTPS proxy that routes traffic through random IPv6 addresses from your subnet.
 
-## Security Features
+## Security Matrix
 
-🔒 **IPv6-Only Operation**: No IPv4 fallback to prevent IP leakage  
-🔒 **Subnet Validation**: Only uses addresses from your specified IPv6 subnet  
-🔒 **Fail-Safe Design**: Fails fast if IPv6 is not available  
-🔒 **No DNS Leaks**: All connections forced through IPv6  
+| Protocol | Target | Action |
+|----------|--------|--------|
+| HTTP | IPv4 | ❌ **BLOCKED** |
+| HTTPS | IPv4 | ❌ **BLOCKED** |
+| HTTP | IPv6 | ✅ **PROXIED** |
+| HTTPS | IPv6 | ✅ **PROXIED** |
+
+**By Design**: IPv4 requests are blocked to prevent IP leakage. Only IPv6 traffic is proxied.
 
 ## Performance
 
 ```
-Benchmark Results (Apple M2, Go 1.24):
-├── Pipeline Throughput: 179,602 req/sec (5.9μs latency)
-├── IPv6 Generation: 5,448,044 ops/sec (219ns per address)
-├── Target Resolution: 9,412,366 ops/sec (163ns per resolve)
-├── Memory Efficiency: 680 B/op, 20 allocs/op
-└── Resource Usage: 2 goroutines, minimal overhead
+Benchmark Results (Apple M2, Go 1.21):
+├── Pipeline Throughput: 199,588 req/sec (5.9μs latency)
+├── IPv6 Generation: 4,161,603 ops/sec (282ns per address)
+├── Target Resolution: 7,660,347 ops/sec (155ns per resolve)
+├── Memory Efficiency: 792 B/op, 25 allocs/op
+└── Resource Usage: 2 goroutines per pipeline
 ```
-
-### Pipeline Architecture
-
-The proxy uses a high-performance pipeline with dynamic worker pools:
-
-```
-HTTP/HTTPS Request → IPv6Generator → TargetProcessor → ProxyProcessor → Response
-                     (219ns)        (163ns)          (HTTP/HTTPS Exec)
-```
-
-**Stage Breakdown:**
-- **IPv6Generator** (219ns): Generates random IPv6 addresses from your subnet
-- **TargetProcessor** (163ns): Resolves target host and determines HTTP/HTTPS protocol  
-- **ProxyProcessor**: Executes HTTP requests or HTTPS CONNECT tunneling
-
-**Performance Characteristics:**
-- **Latency**: 5.9μs per request through full pipeline
-- **Memory**: 680 bytes per operation, 20 allocations
-- **Scalability**: Auto-scales with CPU cores (default: 2x)
-- **Efficiency**: Only 2 goroutines for pipeline coordination
 
 ## Quick Start
 
-### Option 1: Docker Compose (Recommended)
+### Docker Compose (Recommended)
 
-1. **Configure your subnet** in `docker-compose.yml`:
+1. **Configure** `docker-compose.yml`:
    ```yaml
    environment:
-     - SUBNET=YOUR_IPV6_SUBNET/64  # Replace with your actual subnet
+     - SUBNET=YOUR_IPV6_SUBNET/64  # Replace with your subnet
+     - BIND=0.0.0.0:8080          # Optional: change port
    ```
 
 2. **Deploy**:
@@ -55,35 +40,20 @@ HTTP/HTTPS Request → IPv6Generator → TargetProcessor → ProxyProcessor → 
    docker-compose up -d
    ```
 
-### Option 2: Docker (Manual)
+### Direct Run
 
 ```bash
-# Build and run
-docker build -t ipv6-proxy .
-docker run --privileged --network host \
-  -e SUBNET="YOUR_IPV6_SUBNET/64" \
-  ipv6-proxy
-```
-
-### Option 3: Direct Run
-
-```bash
-# Build
 go build -o ipv6-proxy main.go
-
-# Run
-sudo ./ipv6-proxy -subnet="YOUR_IPV6_SUBNET/64"
+sudo ./ipv6-proxy -subnet="YOUR_IPV6_SUBNET/64" -bind="0.0.0.0:8080"
 ```
 
 ## Usage
 
-Once running, use as HTTP/HTTPS proxy on port 8080:
-
 ```bash
-# Test with curl
+# Test proxy
 curl -x http://127.0.0.1:8080 http://ipv6.icanhazip.com
 
-# Use with applications
+# Configure applications
 export http_proxy=http://127.0.0.1:8080
 export https_proxy=http://127.0.0.1:8080
 ```
@@ -92,48 +62,31 @@ export https_proxy=http://127.0.0.1:8080
 
 ### Environment Variables (Docker)
 - `SUBNET`: Your IPv6 subnet (required) - e.g., `2a01:4f9:c012:83eb::/64`
-- `BIND`: Proxy listen address (default: `0.0.0.0:8080`)
-- `WORKERS`: Number of workers (default: auto-detected)
+- `BIND`: Listen address (default: `0.0.0.0:8080`)
+- `WORKERS`: Worker count (default: auto)
 
-### Command Line Flags (Direct run)
-- `-bind`: Proxy listen address (default: `0.0.0.0:8080`)
-- `-subnet`: Your IPv6 subnet (required)
-- `-workers`: Number of workers (default: 2x CPU cores)
+### Command Line Flags
+- `-subnet`: IPv6 subnet (required)
+- `-bind`: Listen address (default: `localhost:8080`)
+- `-workers`: Worker count (default: 2x CPU cores)
 
 ## Requirements
 
-- Linux server with IPv6 subnet (e.g., from Vultr, Hetzner, DigitalOcean)
-- **IPv6-only environment** - no IPv4 fallback for security
-- Docker and docker-compose installed
-- Root privileges (automatically handled by Docker)
+- Linux VPS with IPv6 subnet (Vultr, Hetzner, DigitalOcean)
+- Docker + docker-compose
+- Root privileges (for IPv6 routing)
 
-**⚠️ Security Note:** This proxy operates in IPv6-only mode to prevent IP leakage. If IPv6 is not properly configured, the proxy will fail rather than fall back to IPv4.
+**Getting IPv6 Subnet:**
+1. Order VPS with IPv6 from cloud provider
+2. Find your subnet (format: `2a01:4f9:c012:83eb::/64`)
+3. Update `SUBNET` in docker-compose.yml
 
-**How to get IPv6 subnet:**
-1. Order VPS with IPv6 support from providers like Vultr, Hetzner
-2. Your subnet will be something like `2a01:4f9:c012:83eb::/64`
-3. Replace the `SUBNET` value in docker-compose.yml with your actual subnet
-
-The proxy automatically configures the necessary IPv6 routing rules on startup.
-
-## Performance Testing
-
-To test performance yourself:
+## Testing
 
 ```bash
-# Basic performance test
-curl -x http://127.0.0.1:8080 http://httpbin.org/ip
-
-# Load testing with Apache Bench
-ab -n 1000 -c 10 -X 127.0.0.1:8080 http://httpbin.org/ip
-
-# Check different IPv6 addresses
-for i in {1..5}; do
-  curl -x http://127.0.0.1:8080 http://ipv6.icanhazip.com
-done
-
-# Run your own benchmarks
+# Performance test
 go test -bench=. ./internal/proxy/
-```
 
-The proxy generates a new random IPv6 address from your subnet for each request, providing excellent IP rotation with minimal performance impact.
+# IP rotation test
+for i in {1..5}; do curl -x http://127.0.0.1:8080 http://ipv6.icanhazip.com; done
+```

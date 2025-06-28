@@ -3,6 +3,8 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"net/http/httptest"
 	"runtime"
@@ -18,6 +20,14 @@ import (
 
 	"go.uber.org/mock/gomock"
 )
+
+func init() {
+	// Disable all logging except errors for tests/benchmarks
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{
+		Level: slog.LevelError, // Only show errors
+	}))
+	slog.SetDefault(logger)
+}
 
 // Simple source for benchmarking
 type benchmarkSource struct {
