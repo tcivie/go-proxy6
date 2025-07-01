@@ -95,7 +95,11 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		r,
 		w,
 	)
-	log.Printf("[%s] → %s %s", id, r.Method, r.Host)
+	slog.Info("Request received",
+		"id", id,
+		"method", r.Method,
+		"host", r.Host,
+	)
 
 	// Send to processing channel (non-blocking)
 	select {
