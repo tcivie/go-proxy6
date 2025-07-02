@@ -48,17 +48,7 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 		"via", bindAddr.IP.String(),
 	)
 
-	dialer := &net.Dialer{
-		LocalAddr: bindAddr,
-		Timeout:   10 * time.Second,
-	}
-	targetConn, err := dialer.Dial("tcp6", target)
-	if err != nil {
-		http.Error(resp, "Failed to connect to target", http.StatusBadGateway)
-		payload.MarkResponseSent()
-		return err
-	}
-
+	// Hijack the connection FIRST, before any other operations
 	hijacker, ok := resp.(http.Hijacker)
 	if !ok {
 		http.Error(resp, "Hijacking not supported", http.StatusInternalServerError)
@@ -68,17 +58,31 @@ func (p *ProxyProcessor) handleConnect(payload *pipeline.HTTPPayload) error {
 
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
+		// If hijacking fails, we can still use http.Error since hijack hasn't succeeded
 		http.Error(resp, "Failed to hijack", http.StatusInternalServerError)
 		payload.MarkResponseSent()
 		return err
 	}
 
+	// From this point on, we must handle all responses manually since we've hijacked
 	defer clientConn.Close()
+	payload.MarkResponseSent() // Mark immediately after hijack
+
+	// Now attempt to connect to target
+	dialer := &net.Dialer{
+		LocalAddr: bindAddr,
+		Timeout:   10 * time.Second,
+	}
+	targetConn, err := dialer.Dial("tcp6", target)
+	if err != nil {
+		// Send error response manually since we've hijacked
+		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\nFailed to connect to target\r\n"))
+		return err
+	}
 	defer targetConn.Close()
 
 	// Send 200 OK
 	clientConn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
-	payload.MarkResponseSent()
 
 	// Proxy both ways
 	go io.Copy(targetConn, clientConn)
