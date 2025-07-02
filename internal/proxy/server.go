@@ -134,11 +134,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) processRequests() {
 	defer s.wg.Done()
-
-	// Create source that reads from channel
 	source := &channelSource{ch: s.requestCh, serverCtx: s.ctx}
-
-	// Create sink that handles errors gracefully
 	sink := &errorHandlingSink{}
 
 	// Keep processing requests until server shutdown
@@ -148,23 +144,17 @@ func (s *Server) processRequests() {
 			slog.Info("Request processor shutting down...")
 			return
 		default:
-			// Process a batch of requests
-			// Use a fresh context for each batch so errors don't kill the pipeline
-			batchCtx, batchCancel := context.WithCancel(s.ctx)
-
-			err := s.pipeline.Process(batchCtx, source, sink)
-			batchCancel()
-
+			err := s.pipeline.Process(s.ctx, source, sink)
 			if err != nil && s.ctx.Err() == nil {
 				slog.Warn("Pipeline batch completed with errors (continuing)",
 					"error", err)
-			}
 
-			// Brief pause to prevent tight loop on persistent errors
-			select {
-			case <-time.After(10 * time.Millisecond):
-			case <-s.ctx.Done():
-				return
+				// Brief pause to prevent tight loop on persistent errors
+				select {
+				case <-time.After(100 * time.Millisecond):
+				case <-s.ctx.Done():
+					return
+				}
 			}
 		}
 	}
