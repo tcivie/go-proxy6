@@ -29,14 +29,14 @@ func NewServer(cfg *config.Config) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Default to 2x CPU cores for maximum performance
-	maxWorkers := runtime.NumCPU() * 2
-	if maxWorkers < 4 {
-		maxWorkers = 4
+	maxWorkers := runtime.NumCPU() * 6
+	if maxWorkers < 8 {
+		maxWorkers = 8
 	}
 
 	return &Server{
 		config:     cfg,
-		requestCh:  make(chan *pipeline.HTTPPayload, 1000), // Buffered channel for speed
+		requestCh:  make(chan *pipeline.HTTPPayload, 10_000),
 		ctx:        ctx,
 		cancel:     cancel,
 		maxWorkers: maxWorkers,
@@ -57,7 +57,7 @@ func (s *Server) Start() error {
 	s.pipeline = pipeline.New(
 		pipeline.DynamicWorkerPool(stages.NewIPv6Processor(gen), s.maxWorkers),
 		pipeline.DynamicWorkerPool(stages.NewTargetProcessor(), s.maxWorkers),
-		pipeline.DynamicWorkerPool(stages.NewProxyProcessor(), s.maxWorkers/2), // Fewer workers for actual requests
+		pipeline.DynamicWorkerPool(stages.NewProxyProcessor(), s.maxWorkers*2),
 	)
 
 	// Start request processor with proper error handling
