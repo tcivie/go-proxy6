@@ -3,7 +3,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 )
 
 type dynamicWorkerPool struct {
@@ -53,7 +53,9 @@ stop:
 
 					// Recover from any panics in processors to prevent crashing
 					if r := recover(); r != nil {
-						log.Printf("Pipeline stage %d panic recovered: %v", params.StageIndex(), r)
+						slog.Error("Pipeline stage panic recovered",
+							"stage_index", params.StageIndex(),
+							"panic", r)
 
 						// Try to handle the payload if it's an HTTP payload
 						if httpPayload, ok := payloadIn.(*HTTPPayload); ok {
@@ -71,7 +73,9 @@ stop:
 				payloadOut, err := p.proc.Process(ctx, payloadIn)
 				if err != nil {
 					// Log the error but don't send it to error channel unless it's critical
-					log.Printf("Pipeline stage %d error (handled): %v", params.StageIndex(), err)
+					slog.Warn("Pipeline stage error (handled)",
+						"stage_index", params.StageIndex(),
+						"error", err)
 
 					// For HTTP payloads, ensure proper completion
 					if httpPayload, ok := payloadIn.(*HTTPPayload); ok {

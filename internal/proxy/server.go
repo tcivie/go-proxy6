@@ -8,7 +8,6 @@ import (
 	"go-proxy6/internal/ipv6"
 	"go-proxy6/internal/pipeline"
 	"go-proxy6/internal/stages"
-	"log"
 	"log/slog"
 	"net/http"
 	"runtime"
@@ -108,7 +107,9 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		select {
 		case err := <-payload.Done():
 			if err != nil {
-				log.Printf("Request %s failed: %v", payload.ID, err)
+				slog.Error("Request failed",
+					"request_id", payload.ID,
+					"error", err)
 				// Error response should already be handled by processor
 				// If not handled, send a generic error
 				if !payload.ResponseSent() {
@@ -144,7 +145,7 @@ func (s *Server) processRequests() {
 	for {
 		select {
 		case <-s.ctx.Done():
-			log.Println("Request processor shutting down...")
+			slog.Info("Request processor shutting down...")
 			return
 		default:
 			// Process a batch of requests
@@ -155,8 +156,8 @@ func (s *Server) processRequests() {
 			batchCancel()
 
 			if err != nil && s.ctx.Err() == nil {
-				// Log the error but don't stop processing
-				log.Printf("Pipeline batch completed with errors (continuing): %v", err)
+				slog.Warn("Pipeline batch completed with errors (continuing)",
+					"error", err)
 			}
 
 			// Brief pause to prevent tight loop on persistent errors
@@ -170,11 +171,11 @@ func (s *Server) processRequests() {
 }
 
 func (s *Server) Stop() {
-	log.Println("Shutting down proxy server...")
+	slog.Info("Shutting down proxy server...")
 	s.cancel()
 	close(s.requestCh)
 	s.wg.Wait()
-	log.Println("Proxy server stopped")
+	slog.Info("Proxy server stopped")
 }
 
 // channelSource implements pipeline.Source for channel-based input
